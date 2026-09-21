@@ -1,176 +1,635 @@
-#include <Wire.h>
-#include "ESP32_NOW.h"
-#include "WiFi.h"
-#include <esp_mac.h>  // For the MAC2STR and MACSTR macros
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_mac.h>
+#include <esp_wifi.h>
 #include <LiquidCrystal_I2C.h>
+#include <string.h>
+#include <vector>
 
-/* === DEFINITIONS === */
-
-#define DEFAULT_WIFI_CHANNEL 6 // check using "netsh wlan show interfaces" in cmd
+/* =====================================================
+   CONFIGURATION
+   ===================================================== */
+#define SLAVE_CHANNEL 6
 #define WIFI_SSID "Sapiq"
 #define WIFI_PASSWORD "123581321"
 
+#define WIFI_INTERFACE WIFI_IF_STA
 
-/* === CLASSES === */
+/* =====================================================
+   MESSAGE TYPES
+   ===================================================== */
 
-class ESP_NOW_Broadcast_Peer : public ESP_NOW_Peer {
-public:
-  // Constructor of the class using the broadcast address
-  ESP_NOW_Broadcast_Peer(uint8_t channel, wifi_interface_t iface, const uint8_t *lmk) : ESP_NOW_Peer(ESP_NOW.BROADCAST_ADDR, channel, iface, lmk) {}
+#define MSG_SEARCH_MASTER 0
+#define MSG_MASTER_CONFIRM 1
+#define MSG_MASTER_REQUEST 2
+#define MSG_IRRIGATION_READING 3
+#define MSG_MISTING_READING 4
 
-  // Destructor of the class
-  ~ESP_NOW_Broadcast_Peer() {
-    remove();
-  }
+/* =====================================================
+   DATA STRUCTURES
+   ===================================================== */
 
-  // Function to properly initialize the ESP-NOW and register the broadcast peer
-  bool begin() {
-    if (!ESP_NOW.begin() || !add()) {
-      log_e("Failed to initialize ESP-NOW or register the broadcast peer");
-      return false;
-    }
-    return true;
-  }
+typedef struct __attribute__((packed)) {
+  uint8_t senderMacAddr[6];     
+  uint8_t msgType;
+  char slaveType[16];            
+} search_master;
 
-  // Function to send a message to all devices within the network
-  bool send_message(const uint8_t *data, size_t len) {
-    
-    if (!send(data, len)) {
-      log_e("Failed to broadcast message");
-      return false;
-    }
-    return true;
-  }
+typedef struct __attribute__((packed)) {
+  uint8_t senderMacAddr[6];     
+  uint8_t msgType;
+  int slaveID;                
+} master_confirm;
+
+typedef struct __attribute__((packed)) {
+  uint8_t senderMacAddr[6];  
+  uint8_t msgType;
+  uint8_t receiverMacAddr[6];
+  uint8_t slaveID;
+  char slaveType[16];
+} master_request;
+
+typedef struct __attribute__((packed)) {
+  uint8_t senderMacAddr[6];     
+  uint8_t msgType;
+  uint8_t slaveID;
+  char slaveType[16];
+
+  float soilMoist;
+  float waterPH;
+  float fertPH;
+  float waterTDS;
+  float fertTDS;
+
+  bool isPumpActive;
+  bool isWaterValveActive;
+  bool isFertValveActive;
+} irrigation_reading;
+
+/* =====================================================
+   SLAVE INFORMATION
+   ===================================================== */
+
+struct SlaveInfo {
+  uint8_t mac[6];
+  uint16_t slaveID;
+  String slaveType;
 };
 
+std::vector<SlaveInfo> slaves;
 
-/* === GLOBAL VARIABLES === */
+/* =====================================================
+   GLOBAL VARIABLES
+   ===================================================== */
 
-// Peer communication
-uint32_t msg_count = 0;
+uint8_t active_channel = 0;
 
-
-/* === INSTANCES === */
-
-// Broadcast peer object
-ESP_NOW_Broadcast_Peer *broadcast_peer = nullptr;
-
-// LCD
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
+/* =====================================================
+   UTILITY FUNCTIONS
+   ===================================================== */
 
-/* === FUNCTIONS === */
+void printMac(const uint8_t *mac) {
+  Serial.printf(
+    "%02X:%02X:%02X:%02X:%02X:%02X",
+    mac[0], mac[1], mac[2],
+    mac[3], mac[4], mac[5]
+  );
+}
 
-// Print to both lcd and serial
-void printSingleLog(const char* string, int duration = 0){
+void printSingleLog(
+  const char *text,
+  int duration = 0
+) {
+  Serial.println(text);
+
   lcd.clear();
-
   lcd.setCursor(0, 0);
-  Serial.println(string);
-  lcd.print(string);
+  lcd.print(text);
 
-  if (duration != 0){
+  if (duration > 0) {
     delay(duration);
     lcd.clear();
   }
 }
 
-void printDoubleLog(const char* string0, const char* string1, int duration = 0){
+void printDoubleLog(
+  const char *line1,
+  const char *line2,
+  int duration = 0
+) {
+  Serial.println(line1);
+  Serial.println(line2);
+
   lcd.clear();
 
   lcd.setCursor(0, 0);
-  Serial.println(string0);
-  lcd.print(string0);
+  lcd.print(line1);
 
   lcd.setCursor(0, 1);
-  Serial.println(string1);
-  lcd.print(string1);
+  lcd.print(line2);
 
-  if (duration != 0){
+  if (duration > 0) {
     delay(duration);
     lcd.clear();
   }
 }
 
-/* Main */
+bool isSlaveRegistered(const uint8_t *mac) {
+  for (const auto &slave : slaves) {
+    if (memcmp(slave.mac, mac, 6) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool addSlavePeer(const uint8_t *mac) {
+  if (esp_now_is_peer_exist(mac)) {
+    Serial.println("Slave peer already exists.");
+    return true;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+
+  memcpy(
+    peerInfo.peer_addr,
+    mac,
+    6
+  );
+
+  peerInfo.channel = active_channel;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+
+  esp_err_t result = esp_now_add_peer(&peerInfo);
+
+  if (result != ESP_OK) {
+    Serial.printf(
+      "Failed to add Slave peer: %s\n",
+      esp_err_to_name(result)
+    );
+
+    return false;
+  }
+
+  Serial.println("Slave peer added successfully.");
+
+  return true;
+}
+
+/* =====================================================
+   SLAVE DISCOVERY
+   ===================================================== */
+
+void onDiscSlave(
+  const esp_now_recv_info_t *info,
+  const uint8_t *incomingData,
+  int len
+) {
+  if (len != sizeof(search_master)) {
+    Serial.println("Invalid search_master size.");
+    return;
+  }
+
+  search_master searchMessage;
+
+  memcpy(
+    &searchMessage,
+    incomingData,
+    sizeof(searchMessage)
+  );
+
+  if (searchMessage.msgType != MSG_SEARCH_MASTER) {
+    return;
+  }
+
+  Serial.println("\n==============================");
+  Serial.println("SLAVE DISCOVERY RECEIVED");
+  Serial.println("==============================");
+
+  Serial.print("Slave MAC: ");
+  printMac(info->src_addr);
+  Serial.println();
+
+  Serial.printf(
+    "Slave type: %s\n",
+    searchMessage.slaveType
+  );
+
+  if (isSlaveRegistered(info->src_addr)) {
+    Serial.println("Slave already registered.");
+    return;
+  }
+
+  if (!addSlavePeer(info->src_addr)) {
+    Serial.println("Could not register Slave.");
+    return;
+  }
+
+  SlaveInfo newSlave = {};
+
+  memcpy(
+    newSlave.mac,
+    info->src_addr,
+    6
+  );
+
+  newSlave.slaveID = slaves.size() + 1;
+  newSlave.slaveType = String(searchMessage.slaveType);
+
+  slaves.push_back(newSlave);
+
+  // Create confirmation message
+  master_confirm confirmMessage = {};
+
+  WiFi.macAddress(confirmMessage.senderMacAddr);
+
+  confirmMessage.msgType = MSG_MASTER_CONFIRM;
+  confirmMessage.slaveID = newSlave.slaveID;
+
+  esp_err_t result = esp_now_send(
+    newSlave.mac,
+    (uint8_t *)&confirmMessage,
+    sizeof(confirmMessage)
+  );
+
+  Serial.printf(
+    "Confirmation status: %s\n",
+    esp_err_to_name(result)
+  );
+
+  if (result == ESP_OK) {
+    Serial.printf(
+      "Successfully registered Slave #%d\n",
+      newSlave.slaveID
+    );
+  }
+}
+
+/* =====================================================
+   SENSOR READING HANDLER
+   ===================================================== */
+
+void onRecvReading_Irrigation(
+  const uint8_t *incomingData,
+  int len
+) {
+  if (len != sizeof(irrigation_reading)) {
+    Serial.println("Invalid irrigation_reading size.");
+    return;
+  }
+
+  irrigation_reading reading;
+
+  memcpy(
+    &reading,
+    incomingData,
+    sizeof(reading)
+  );
+
+  if (reading.msgType != MSG_IRRIGATION_READING) {
+    return;
+  }
+
+  Serial.println("\n==============================");
+  Serial.println("IRRIGATION READING RECEIVED");
+  Serial.println("==============================");
+
+  Serial.printf(
+    "Slave type: %s\n",
+    reading.slaveType
+  );
+
+  Serial.printf(
+    "Slave ID: %d\n",
+    reading.slaveID
+  );
+
+  Serial.printf(
+    "Soil moisture: %.2f\n",
+    reading.soilMoist
+  );
+
+  Serial.printf(
+    "Water pH: %.2f\n",
+    reading.waterPH
+  );
+
+  Serial.printf(
+    "Water TDS: %.2f\n",
+    reading.waterTDS
+  );
+
+  Serial.printf(
+    "Water valve: %s\n",
+    reading.isWaterValveActive ? "ON" : "OFF"
+  );
+
+  Serial.printf(
+    "Fertilizer pH: %.2f\n",
+    reading.fertPH
+  );
+
+  Serial.printf(
+    "Fertilizer TDS: %.2f\n",
+    reading.fertTDS
+  );
+
+  Serial.printf(
+    "Fertilizer valve: %s\n",
+    reading.isFertValveActive ? "ON" : "OFF"
+  );
+
+  Serial.printf(
+    "Irrigation pump: %s\n",
+    reading.isPumpActive ? "ON" : "OFF"
+  );
+
+  char line[17];
+
+  snprintf(
+    line,
+    sizeof(line),
+    "Slave #%d",
+    reading.slaveID
+  );
+
+  printDoubleLog(
+    "Received from:",
+    line,
+    1000
+  );
+}
+
+/* =====================================================
+   ESP-NOW RECEIVE CALLBACK
+   ===================================================== */
+
+void onDataRecv(
+  const esp_now_recv_info_t *info,
+  const uint8_t *incomingData,
+  int len
+) {
+  Serial.printf(
+    "\nReceived data from " MACSTR
+    " | Length: %d\n",
+    MAC2STR(info->src_addr),
+    len
+  );
+
+  if (len < 7) {
+    Serial.println("Packet too short.");
+    return;
+  }
+
+  uint8_t msgType;
+
+  memcpy(
+    &msgType,
+    incomingData + 6,
+    sizeof(msgType)
+  );
+
+  Serial.printf(
+    "Message type: %d\n",
+    msgType
+  );
+
+  switch (msgType) {
+    case MSG_SEARCH_MASTER:
+      onDiscSlave(info, incomingData, len);
+      break;
+
+    case MSG_IRRIGATION_READING:
+      onRecvReading_Irrigation(incomingData, len);
+      break;
+
+    default:
+      Serial.println("Unknown message type.");
+      break;
+  }
+}
+
+/* =====================================================
+   SETUP
+   ===================================================== */
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);
 
-  // LCD I2C
-  lcd.init();         // inisialisasi LCD
-  lcd.backlight();    // nyalakan lampu
-  printSingleLog("Initializing...", 2000);
+  Serial.println("\n==============================");
+  Serial.println("     MASTER CONTROLLER");
+  Serial.println("==============================");
 
+  lcd.init();
+  lcd.backlight();
 
+  WiFi.mode(WIFI_STA);
 
-  // === WIFI MODULE ===
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
 
-  // Initialize the Wi-Fi module
-  WiFi.mode(WIFI_AP_STA);           // configure wifi mode
-  WiFi.setChannel(DEFAULT_WIFI_CHANNEL);    // set wifi channel
+  Serial.print("Connecting to Wi-Fi");
 
-  // Starting subsystem station (STA) for peer connection
-  printSingleLog("Starting STA...", 0);
-  while (!WiFi.STA.started()) {
-    Serial.println("Starting STA...");
-    delay(100);
-  }
-  delay(2000);
-  printSingleLog("STA started", 2000);
+  unsigned long startTime = millis();
 
-  // Initiate WIFI connection
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  printSingleLog("Connecting...", 0);
-  while(WiFi.status() != WL_CONNECTED) {  // shows that the module is still trying to connect to the WIFI connection
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - startTime < 30000
+  ) {
     delay(500);
     Serial.print(".");
   }
-  printDoubleLog("Connected WIFI:", WIFI_SSID, 2000);
 
-  // Report WiFi parameters
-  Serial.println("Saya-Berselancar: Master");
-  Serial.println("Wi-Fi parameters:");
-  Serial.println("  Mode: STA");
-  Serial.println("  MAC Address: " + WiFi.macAddress());
-  Serial.println(String("  SSID: ") + WIFI_SSID);
-  Serial.println("  IP Address: " + WiFi.localIP().toString());
-  Serial.printf("  Channel: %d\n", WiFi.channel());
+  Serial.println();
 
-  // Dynamically create the peer using the actual connected channel
-  uint8_t active_channel = WiFi.channel();
-  broadcast_peer = new ESP_NOW_Broadcast_Peer(active_channel, WIFI_IF_STA, nullptr);
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi connection failed.");
 
-  // === ESP-NOW PROTOCOL ===
-
-  // Register the broadcast peer
-  if (!broadcast_peer->begin()) {
-    Serial.println("Failed to initialize broadcast peer");
-    Serial.println("Rebooting in 5 seconds...");
-    delay(5000);
-    ESP.restart();
+    while (true) {
+      delay(1000);
+    }
   }
 
-  // Report ESP-NOW successful
-  String espNowVerStr = "ESP-NOW v" + String(ESP_NOW.getVersion());
-  printDoubleLog("Master online", espNowVerStr.c_str(), 2000);
+  active_channel = WiFi.channel();
 
+  Serial.println("Wi-Fi connected.");
+  Serial.printf(
+    "Wi-Fi channel: %d\n",
+    active_channel
+  );
 
+  Serial.print("Master MAC: ");
+  Serial.println(WiFi.macAddress());
 
-  // === SETUP COMPLETE === 
-  printSingleLog("Setup complete!", 2000);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  /*
+     ESP-NOW initialization
+  */
+
+  esp_err_t result = esp_now_init();
+
+  if (result != ESP_OK) {
+    Serial.printf(
+      "ESP-NOW initialization failed: %s\n",
+      esp_err_to_name(result)
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  result = esp_now_register_recv_cb(onDataRecv);
+
+  if (result != ESP_OK) {
+    Serial.printf(
+      "Failed to register callback: %s\n",
+      esp_err_to_name(result)
+    );
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("ESP-NOW initialized.");
+  Serial.println("Receive callback registered.");
+
+  /*
+     Add broadcast peer.
+     Ini tidak wajib untuk menerima broadcast,
+     tetapi diperlukan untuk mengirim broadcast.
+  */
+
+  uint8_t broadcastAddress[] = {
+    0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF
+  };
+
+  esp_now_peer_info_t broadcastPeer = {};
+
+  memcpy(
+    broadcastPeer.peer_addr,
+    broadcastAddress,
+    6
+  );
+
+  broadcastPeer.channel = active_channel;
+  broadcastPeer.ifidx = WIFI_IF_STA;
+  broadcastPeer.encrypt = false;
+
+  result = esp_now_add_peer(&broadcastPeer);
+
+  if (result != ESP_OK &&
+      result != ESP_ERR_ESPNOW_EXIST) {
+    Serial.printf(
+      "Failed to add broadcast peer: %s\n",
+      esp_err_to_name(result)
+    );
+  }
+
+  printSingleLog(
+    "Master online",
+    2000
+  );
+
+  Serial.println("Setup complete.");
 }
 
+/* =====================================================
+   LOOP
+   ===================================================== */
+
 void loop() {
-  // Broadcast a message to all devices within the network
-  char data[32];
-  snprintf(data, sizeof(data), "Command #%lu", msg_count++);
+  static unsigned long lastPolling = 0;
+  static unsigned long lastStatus = 0;
 
-  printDoubleLog("Broadcast Msg:", data);
+  /*
+     Print status setiap 10 detik
+  */
 
-  if (!broadcast_peer->send_message((uint8_t *)data, sizeof(data))) {
-    Serial.println("Failed to broadcast message");
+  if (millis() - lastStatus >= 10000) {
+    lastStatus = millis();
+
+    Serial.println("\n=== MASTER STATUS ===");
+
+    Serial.printf(
+      "Registered slaves: %d\n",
+      slaves.size()
+    );
+
+    Serial.printf(
+      "Channel: %d\n",
+      active_channel
+    );
   }
 
-  delay(5000);
+  /*
+     Polling setiap 5 detik
+  */
+
+  if (
+    slaves.size() > 0 &&
+    millis() - lastPolling >= 5000
+  ) {
+    lastPolling = millis();
+
+    Serial.println("\n=== POLLING SLAVES ===");
+
+    for (auto &slave : slaves) {
+      master_request requestMessage = {};
+
+      WiFi.macAddress(
+        requestMessage.senderMacAddr
+      );
+
+      requestMessage.msgType = MSG_MASTER_REQUEST;
+
+      memcpy(
+        requestMessage.receiverMacAddr,
+        slave.mac,
+        6
+      );
+
+      requestMessage.slaveID = slave.slaveID;
+
+      strncpy(
+        requestMessage.slaveType,
+        slave.slaveType.c_str(),
+        sizeof(requestMessage.slaveType) - 1
+      );
+
+      Serial.printf(
+        "Requesting Slave #%d (",
+        slave.slaveID
+      );
+
+      printMac(slave.mac);
+      Serial.println(")");
+
+      esp_err_t result = esp_now_send(
+        slave.mac,
+        (uint8_t *)&requestMessage,
+        sizeof(requestMessage)
+      );
+
+      Serial.printf(
+        "Request status: %s\n",
+        esp_err_to_name(result)
+      );
+
+      delay(100);
+    }
+  }
+
+  delay(10);
 }
