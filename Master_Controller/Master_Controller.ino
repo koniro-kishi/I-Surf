@@ -9,11 +9,12 @@
 /* =====================================================
    CONFIGURATION
    ===================================================== */
-#define SLAVE_CHANNEL 6
+#define DEFAULT_WIFI_CHANNEL 6
 #define WIFI_SSID "Sapiq"
 #define WIFI_PASSWORD "123581321"
-
 #define WIFI_INTERFACE WIFI_IF_STA
+#define STAT_INTERVAL 10000 // 10 sec
+#define POLL_INTERVAL 5000  // 5 sec
 
 /* =====================================================
    MESSAGE TYPES
@@ -29,18 +30,21 @@
    DATA STRUCTURES
    ===================================================== */
 
+// 0. Slave searching for a master
 typedef struct __attribute__((packed)) {
   uint8_t senderMacAddr[6];     
   uint8_t msgType;
   char slaveType[16];            
 } search_master;
 
+// 1. Master confirming slave is searching for master
 typedef struct __attribute__((packed)) {
   uint8_t senderMacAddr[6];     
   uint8_t msgType;
   int slaveID;                
 } master_confirm;
 
+// 2. Master requesting slave for reading reports
 typedef struct __attribute__((packed)) {
   uint8_t senderMacAddr[6];  
   uint8_t msgType;
@@ -49,6 +53,7 @@ typedef struct __attribute__((packed)) {
   char slaveType[16];
 } master_request;
 
+// 3. Irrigation slave reading report
 typedef struct __attribute__((packed)) {
   uint8_t senderMacAddr[6];     
   uint8_t msgType;
@@ -65,6 +70,20 @@ typedef struct __attribute__((packed)) {
   bool isWaterValveActive;
   bool isFertValveActive;
 } irrigation_reading;
+
+// 4. Misting slave reading report
+typedef struct __attribute__((packed)) {
+  uint8_t senderMacAddr[6];     
+  uint8_t msgType;
+  uint8_t slaveID;
+  char slaveType[16];
+
+  float airMoist;
+  float airTemp;
+  float lighting;
+
+  bool isPumpActive;
+} misting_reading;
 
 /* =====================================================
    SLAVE INFORMATION
@@ -90,6 +109,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
    UTILITY FUNCTIONS
    ===================================================== */
 
+// Print mac address as a string
 void printMac(const uint8_t *mac) {
   Serial.printf(
     "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -98,10 +118,8 @@ void printMac(const uint8_t *mac) {
   );
 }
 
-void printSingleLog(
-  const char *text,
-  int duration = 0
-) {
+// Print one line of string in both serial and LCD
+void printSingleLog(const char *text, int duration = 0) {
   Serial.println(text);
 
   lcd.clear();
@@ -114,6 +132,7 @@ void printSingleLog(
   }
 }
 
+// Print two line of string in both serial and LCD
 void printDoubleLog(
   const char *line1,
   const char *line2,
@@ -136,6 +155,7 @@ void printDoubleLog(
   }
 }
 
+// Check if a slave is already in slaves vector
 bool isSlaveRegistered(const uint8_t *mac) {
   for (const auto &slave : slaves) {
     if (memcmp(slave.mac, mac, 6) == 0) {
@@ -146,24 +166,23 @@ bool isSlaveRegistered(const uint8_t *mac) {
   return false;
 }
 
+// Add slave as a peer and storing its information
 bool addSlavePeer(const uint8_t *mac) {
+  // Check if peer is registered in ESP-NOW's peer table
   if (esp_now_is_peer_exist(mac)) {
     Serial.println("Slave peer already exists.");
     return true;
   }
 
+  // Creating a peer instance
   esp_now_peer_info_t peerInfo = {};
 
-  memcpy(
-    peerInfo.peer_addr,
-    mac,
-    6
-  );
-
+  memcpy(peerInfo.peer_addr, mac, 6);
   peerInfo.channel = active_channel;
   peerInfo.ifidx = WIFI_IF_STA;
   peerInfo.encrypt = false;
 
+  // Adding the peer
   esp_err_t result = esp_now_add_peer(&peerInfo);
 
   if (result != ESP_OK) {
@@ -184,27 +203,18 @@ bool addSlavePeer(const uint8_t *mac) {
    SLAVE DISCOVERY
    ===================================================== */
 
-void onDiscSlave(
-  const esp_now_recv_info_t *info,
-  const uint8_t *incomingData,
-  int len
-) {
+void onDiscSlave(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  // Check if the message type is incorrectly assigned to the data
+  // So it is actually not a search_master data
   if (len != sizeof(search_master)) {
     Serial.println("Invalid search_master size.");
     return;
   }
 
+  // Create search message
   search_master searchMessage;
 
-  memcpy(
-    &searchMessage,
-    incomingData,
-    sizeof(searchMessage)
-  );
-
-  if (searchMessage.msgType != MSG_SEARCH_MASTER) {
-    return;
-  }
+  memcpy(&searchMessage, incomingData, sizeof(searchMessage));
 
   Serial.println("\n==============================");
   Serial.println("SLAVE DISCOVERY RECEIVED");
@@ -219,24 +229,22 @@ void onDiscSlave(
     searchMessage.slaveType
   );
 
+  // Check if the slave is already in slaves vector
   if (isSlaveRegistered(info->src_addr)) {
     Serial.println("Slave already registered.");
     return;
   }
 
+  // Try to add slave as a peer
   if (!addSlavePeer(info->src_addr)) {
     Serial.println("Could not register Slave.");
     return;
   }
 
+  // Store the information of the new slave
   SlaveInfo newSlave = {};
 
-  memcpy(
-    newSlave.mac,
-    info->src_addr,
-    6
-  );
-
+  memcpy(newSlave.mac, info->src_addr, 6);
   newSlave.slaveID = slaves.size() + 1;
   newSlave.slaveType = String(searchMessage.slaveType);
 
@@ -250,11 +258,8 @@ void onDiscSlave(
   confirmMessage.msgType = MSG_MASTER_CONFIRM;
   confirmMessage.slaveID = newSlave.slaveID;
 
-  esp_err_t result = esp_now_send(
-    newSlave.mac,
-    (uint8_t *)&confirmMessage,
-    sizeof(confirmMessage)
-  );
+  // Try to send the confirmation message
+  esp_err_t result = esp_now_send(newSlave.mac, (uint8_t *)&confirmMessage, sizeof(confirmMessage));
 
   Serial.printf(
     "Confirmation status: %s\n",
@@ -273,131 +278,60 @@ void onDiscSlave(
    SENSOR READING HANDLER
    ===================================================== */
 
-void onRecvReading_Irrigation(
-  const uint8_t *incomingData,
-  int len
-) {
+void onRecvReading_Irrigation(const uint8_t *incomingData, int len) {
+  // Check if the message type is incorrectly assigned to the data
+  // So it is actually not a irrigation_reading data
   if (len != sizeof(irrigation_reading)) {
     Serial.println("Invalid irrigation_reading size.");
     return;
   }
 
+  // Create irrigation reading message
   irrigation_reading reading;
-
-  memcpy(
-    &reading,
-    incomingData,
-    sizeof(reading)
-  );
-
-  if (reading.msgType != MSG_IRRIGATION_READING) {
-    return;
-  }
+  memcpy(&reading, incomingData,sizeof(reading));
 
   Serial.println("\n==============================");
   Serial.println("IRRIGATION READING RECEIVED");
   Serial.println("==============================");
 
-  Serial.printf(
-    "Slave type: %s\n",
-    reading.slaveType
-  );
+  Serial.printf("Slave type: %s\n", reading.slaveType);
+  Serial.printf("Slave ID: %d\n", reading.slaveID);
+  Serial.printf("Soil moisture: %.2f\n", reading.soilMoist);
+  Serial.printf("Water pH: %.2f\n", reading.waterPH);
+  Serial.printf("Water TDS: %.2f\n", reading.waterTDS);
+  Serial.printf("Water valve: %s\n", reading.isWaterValveActive ? "ON" : "OFF");
+  Serial.printf("Fertilizer pH: %.2f\n", reading.fertPH);
+  Serial.printf("Fertilizer TDS: %.2f\n", reading.fertTDS);
+  Serial.printf("Fertilizer valve: %s\n", reading.isFertValveActive ? "ON" : "OFF");
+  Serial.printf("Irrigation pump: %s\n", reading.isPumpActive ? "ON" : "OFF");
 
-  Serial.printf(
-    "Slave ID: %d\n",
-    reading.slaveID
-  );
-
-  Serial.printf(
-    "Soil moisture: %.2f\n",
-    reading.soilMoist
-  );
-
-  Serial.printf(
-    "Water pH: %.2f\n",
-    reading.waterPH
-  );
-
-  Serial.printf(
-    "Water TDS: %.2f\n",
-    reading.waterTDS
-  );
-
-  Serial.printf(
-    "Water valve: %s\n",
-    reading.isWaterValveActive ? "ON" : "OFF"
-  );
-
-  Serial.printf(
-    "Fertilizer pH: %.2f\n",
-    reading.fertPH
-  );
-
-  Serial.printf(
-    "Fertilizer TDS: %.2f\n",
-    reading.fertTDS
-  );
-
-  Serial.printf(
-    "Fertilizer valve: %s\n",
-    reading.isFertValveActive ? "ON" : "OFF"
-  );
-
-  Serial.printf(
-    "Irrigation pump: %s\n",
-    reading.isPumpActive ? "ON" : "OFF"
-  );
-
+  // Message footer
   char line[17];
+  snprintf(line, sizeof(line), "Slave #%d", reading.slaveID);
 
-  snprintf(
-    line,
-    sizeof(line),
-    "Slave #%d",
-    reading.slaveID
-  );
-
-  printDoubleLog(
-    "Received from:",
-    line,
-    1000
-  );
+  printDoubleLog("Received from:", line, 1000);
 }
 
 /* =====================================================
    ESP-NOW RECEIVE CALLBACK
    ===================================================== */
 
-void onDataRecv(
-  const esp_now_recv_info_t *info,
-  const uint8_t *incomingData,
-  int len
-) {
-  Serial.printf(
-    "\nReceived data from " MACSTR
-    " | Length: %d\n",
-    MAC2STR(info->src_addr),
-    len
-  );
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  Serial.printf("\nReceived data from " MACSTR " | Length: %d\n", MAC2STR(info->src_addr), len);
 
+  // Packet too short for it to be a message from slave
   if (len < 7) {
     Serial.println("Packet too short.");
     return;
   }
 
+  // Get the message type of the incoming message from slave
   uint8_t msgType;
+  memcpy(&msgType, incomingData + 6, sizeof(msgType));
 
-  memcpy(
-    &msgType,
-    incomingData + 6,
-    sizeof(msgType)
-  );
+  Serial.printf("Message type: %d\n", msgType);
 
-  Serial.printf(
-    "Message type: %d\n",
-    msgType
-  );
-
+  // Call appropriate handler based on the message type
   switch (msgType) {
     case MSG_SEARCH_MASTER:
       onDiscSlave(info, incomingData, len);
@@ -428,27 +362,26 @@ void setup() {
   lcd.init();
   lcd.backlight();
 
-  WiFi.mode(WIFI_STA);
+  /*
+    WiFi module initialization
+  */
 
-  WiFi.begin(
-    WIFI_SSID,
-    WIFI_PASSWORD
-  );
+   // Initialize the WiFi module
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print("Connecting to Wi-Fi");
+  printSingleLog("Connecting to Wi-Fi", 0);
 
   unsigned long startTime = millis();
 
-  while (
-    WiFi.status() != WL_CONNECTED &&
-    millis() - startTime < 30000
-  ) {
+  // Wait for WiFi to connect
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
     delay(500);
     Serial.print(".");
   }
-
   Serial.println();
 
+  // case: failed to connect after 30 sec, proceed to restart
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi connection failed.");
 
@@ -457,13 +390,11 @@ void setup() {
     }
   }
 
+  // Storing the wifi channel
   active_channel = WiFi.channel();
 
   Serial.println("Wi-Fi connected.");
-  Serial.printf(
-    "Wi-Fi channel: %d\n",
-    active_channel
-  );
+  Serial.printf("Wi-Fi channel: %d\n", active_channel);
 
   Serial.print("Master MAC: ");
   Serial.println(WiFi.macAddress());
@@ -475,25 +406,22 @@ void setup() {
      ESP-NOW initialization
   */
 
+  // Initialize the ESP-NOW module
   esp_err_t result = esp_now_init();
 
   if (result != ESP_OK) {
-    Serial.printf(
-      "ESP-NOW initialization failed: %s\n",
-      esp_err_to_name(result)
-    );
+    Serial.printf("ESP-NOW initialization failed: %s\n", esp_err_to_name(result));
 
     while (true) {
       delay(1000);
     }
   }
 
+  // Registering callbacks
   result = esp_now_register_recv_cb(onDataRecv);
 
   if (result != ESP_OK) {
-    Serial.printf(
-      "Failed to register callback: %s\n",
-      esp_err_to_name(result)
+    Serial.printf("Failed to register callback: %s\n", esp_err_to_name(result)
     );
 
     while (true) {
@@ -506,41 +434,39 @@ void setup() {
 
   /*
      Add broadcast peer.
-     Ini tidak wajib untuk menerima broadcast,
-     tetapi diperlukan untuk mengirim broadcast.
+     Not needed to receive broadcast,
+     But needed to send broadcast.
+     Currently unneeded, but who knows what the future holds
   */
 
-  uint8_t broadcastAddress[] = {
-    0xFF, 0xFF, 0xFF,
-    0xFF, 0xFF, 0xFF
-  };
+  // uint8_t broadcastAddress[] = {
+  //   0xFF, 0xFF, 0xFF,
+  //   0xFF, 0xFF, 0xFF
+  // };
 
-  esp_now_peer_info_t broadcastPeer = {};
+  // esp_now_peer_info_t broadcastPeer = {};
 
-  memcpy(
-    broadcastPeer.peer_addr,
-    broadcastAddress,
-    6
-  );
+  // memcpy(
+  //   broadcastPeer.peer_addr,
+  //   broadcastAddress,
+  //   6
+  // );
 
-  broadcastPeer.channel = active_channel;
-  broadcastPeer.ifidx = WIFI_IF_STA;
-  broadcastPeer.encrypt = false;
+  // broadcastPeer.channel = active_channel;
+  // broadcastPeer.ifidx = WIFI_IF_STA;
+  // broadcastPeer.encrypt = false;
 
-  result = esp_now_add_peer(&broadcastPeer);
+  // result = esp_now_add_peer(&broadcastPeer);
 
-  if (result != ESP_OK &&
-      result != ESP_ERR_ESPNOW_EXIST) {
-    Serial.printf(
-      "Failed to add broadcast peer: %s\n",
-      esp_err_to_name(result)
-    );
-  }
+  // if (result != ESP_OK &&
+  //     result != ESP_ERR_ESPNOW_EXIST) {
+  //   Serial.printf(
+  //     "Failed to add broadcast peer: %s\n",
+  //     esp_err_to_name(result)
+  //   );
+  // }
 
-  printSingleLog(
-    "Master online",
-    2000
-  );
+  printSingleLog("Master online", 2000);
 
   Serial.println("Setup complete.");
 }
@@ -554,78 +480,51 @@ void loop() {
   static unsigned long lastStatus = 0;
 
   /*
-     Print status setiap 10 detik
+     Print status each interval of STAT_INTERVAL secs
   */
 
-  if (millis() - lastStatus >= 10000) {
+  if (millis() - lastStatus >= STAT_INTERVAL) {
     lastStatus = millis();
 
     Serial.println("\n=== MASTER STATUS ===");
 
-    Serial.printf(
-      "Registered slaves: %d\n",
-      slaves.size()
-    );
+    Serial.printf("Registered slaves: %d\n", slaves.size());
 
-    Serial.printf(
-      "Channel: %d\n",
-      active_channel
-    );
+    Serial.printf("Channel: %d\n", active_channel);
   }
 
   /*
-     Polling setiap 5 detik
+     Polling each interval of POLL_INTERVAL secs
   */
 
-  if (
-    slaves.size() > 0 &&
-    millis() - lastPolling >= 5000
-  ) {
+  if (slaves.size() > 0 && millis() - lastPolling >= POLL_INTERVAL) {
     lastPolling = millis();
 
     Serial.println("\n=== POLLING SLAVES ===");
 
+    // Poll to each slave
     for (auto &slave : slaves) {
+      // create message
       master_request requestMessage = {};
 
-      WiFi.macAddress(
-        requestMessage.senderMacAddr
-      );
-
+      WiFi.macAddress(requestMessage.senderMacAddr);
+      
       requestMessage.msgType = MSG_MASTER_REQUEST;
-
-      memcpy(
-        requestMessage.receiverMacAddr,
-        slave.mac,
-        6
-      );
-
+      
+      memcpy(requestMessage.receiverMacAddr, slave.mac, 6);
+      
       requestMessage.slaveID = slave.slaveID;
+      
+      strncpy(requestMessage.slaveType, slave.slaveType.c_str(), sizeof(requestMessage.slaveType) - 1);
 
-      strncpy(
-        requestMessage.slaveType,
-        slave.slaveType.c_str(),
-        sizeof(requestMessage.slaveType) - 1
-      );
-
-      Serial.printf(
-        "Requesting Slave #%d (",
-        slave.slaveID
-      );
-
+      Serial.printf("Requesting Slave #%d (", slave.slaveID);
       printMac(slave.mac);
       Serial.println(")");
 
-      esp_err_t result = esp_now_send(
-        slave.mac,
-        (uint8_t *)&requestMessage,
-        sizeof(requestMessage)
-      );
+      // try to send unicast request
+      esp_err_t result = esp_now_send(slave.mac, (uint8_t *)&requestMessage, sizeof(requestMessage));
 
-      Serial.printf(
-        "Request status: %s\n",
-        esp_err_to_name(result)
-      );
+      Serial.printf("Request status: %s\n", esp_err_to_name(result));
 
       delay(100);
     }
