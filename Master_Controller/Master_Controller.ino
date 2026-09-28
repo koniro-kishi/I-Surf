@@ -9,7 +9,6 @@
 /* =====================================================
    CONFIGURATION
    ===================================================== */
-#define DEFAULT_WIFI_CHANNEL 6
 #define WIFI_SSID "Sapiq"
 #define WIFI_PASSWORD "123581321"
 #define WIFI_INTERFACE WIFI_IF_STA

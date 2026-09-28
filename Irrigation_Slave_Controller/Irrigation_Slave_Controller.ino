@@ -6,8 +6,7 @@
 
 /* === DEFINITIONS === */
 
-#define DEFAULT_WIFI_CHANNEL 6
-#define SLAVE_CHANNEL 6
+#define DEFAULT_SLAVE_CHANNEL 1
 #define SLAVE_TYPE "Irrigation"
 #define DEBUG_INTERVAL 10000 // 10 secs
 
@@ -68,6 +67,8 @@ uint16_t slaveID = 0;
 
 volatile bool master_found = false;     // safely used in the background
 volatile bool received_confirm = false;
+uint8_t current_scan_channel;
+uint8_t active_channel;
 
 bool master_peer_added = false;
 
@@ -102,11 +103,11 @@ bool addMasterPeer(const uint8_t *mac) {
     return true;
   }
 
-  // Creating a peer instance
+  // Creating a peer instance for master
   esp_now_peer_info_t peerInfo = {};
   
   memcpy(peerInfo.peer_addr, mac, 6);
-  peerInfo.channel = SLAVE_CHANNEL;
+  peerInfo.channel = active_channel;
   peerInfo.ifidx = WIFI_IF_STA;
   peerInfo.encrypt = false;
 
@@ -167,6 +168,7 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
 
   memcpy(master_mac, senderMac, 6);
   slaveID = confirmMessage.slaveID;
+  active_channel = current_scan_channel;
 
   // Adding the master to ESP-NOW peer table
   if (!addMasterPeer(master_mac)) {
@@ -290,16 +292,10 @@ void setup() {
 
   delay(100);
 
-  // Set fixed channel
-  esp_wifi_set_channel(
-    SLAVE_CHANNEL,
-    WIFI_SECOND_CHAN_NONE
-  );
+  // Set default channel
+  esp_wifi_set_channel(DEFAULT_SLAVE_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  Serial.printf(
-    "Slave channel: %d\n",
-    SLAVE_CHANNEL
-  );
+  Serial.printf("Slave channel: %d\n", DEFAULT_SLAVE_CHANNEL);
 
   Serial.print("Slave MAC: ");
   Serial.println(WiFi.macAddress());
@@ -352,7 +348,7 @@ void setup() {
 
   memcpy(broadcastPeer.peer_addr, broadcastAddress, 6);
 
-  broadcastPeer.channel = SLAVE_CHANNEL;
+  broadcastPeer.channel = 0;
   broadcastPeer.ifidx = WIFI_IF_STA;
   broadcastPeer.encrypt = false;
 
@@ -364,11 +360,6 @@ void setup() {
     );
   }
 
-  /*
-     Channel hopping is inactivated for now
-     Make sure master is using the same static channel
-  */
-
   // create the search message
   search_master searchMessage = {};
 
@@ -378,8 +369,16 @@ void setup() {
   
   strncpy(searchMessage.slaveType, SLAVE_TYPE, sizeof(searchMessage.slaveType) - 1);
 
+
+  // channel hopping loop
+
+  current_scan_channel = DEFAULT_SLAVE_CHANNEL;
+
   while (!master_found) {
-    Serial.printf("Broadcasting search on channel %d...\n", SLAVE_CHANNEL);
+    
+    WiFi.setChannel(current_scan_channel);
+
+    Serial.printf("Broadcasting search on channel %d...\n", current_scan_channel);
 
     // sending a message to broadcast address (broadcasting the message)
     result = esp_now_send(broadcastAddress, (uint8_t *)&searchMessage, sizeof(searchMessage));
@@ -393,6 +392,12 @@ void setup() {
     for (int i = 0; i < 10 && !master_found; i++) {
       delay(100);
     }
+
+    if(master_found){
+      break;
+    }
+
+    current_scan_channel = (current_scan_channel % 13) + 1;
   }
 
   Serial.println("\nConnected to Master!");
@@ -425,15 +430,9 @@ void loop() {
 
     Serial.println();
 
-    Serial.printf(
-      "Slave ID: %d\n",
-      slaveID
-    );
+    Serial.printf("Slave ID: %d\n", slaveID);
 
-    Serial.printf(
-      "Channel: %d\n",
-      SLAVE_CHANNEL
-    );
+    Serial.printf("Channel: %d\n", active_channel);
   }
 
   delay(100);
