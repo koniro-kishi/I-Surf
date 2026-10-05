@@ -1,0 +1,166 @@
+html, body {
+  margin: 0;
+  padding: 0;
+  font-family: Arial, Helvetica, sans-serif;
+  background: #fff;
+  color: #111;
+}
+body {
+  padding: 30px 24px;
+  max-width: 480px;
+  margin: 0 auto;
+}
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 25px;
+}
+.title {
+  font-size: 34px;
+  font-weight: 600;
+  color: #666;
+  margin: 0;
+}
+.refresh-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+.refresh-button img {
+  width: 36px;
+  height: 36px;
+}
+.network-list {
+  width: 100%;
+}
+.network-item {
+  margin-bottom: 4px;
+}
+.network-link {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 72px;
+  padding: 0 75px;
+  border: none;
+  border-radius: 12px;
+  background: #fff;
+  text-align: left;
+  font-size: 27px;
+  color: #111;
+  text-decoration: none;
+  box-sizing: border-box;
+  line-height: 72px;
+}
+.network-link:hover { background: #f5f5f5; }
+.network-link:active { background: #eee; }
+.wifi-icon {
+  position: absolute;
+  left: 18px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+  pointer-events: none;
+}
+.ssid {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+.lock-icon {
+  position: absolute;
+  right: 18px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+/* Detail Page Styles */
+.detail-title {
+  font-size: 24px;
+  color: #666;
+  text-align: center;
+  margin-bottom: 20px;
+  text-transform: uppercase;
+}
+.ssid-header {
+  font-size: 28px;
+  text-align: center;
+  margin: 0 0 25px 0;
+  word-break: break-word;
+  color: #111;
+}
+.password-label {
+  display: block;
+  font-size: 16px;
+  margin-bottom: 8px;
+  color: #555;
+}
+.password-container {
+  position: relative;
+  width: 100%;
+  margin-bottom: 25px;
+}
+.password-input {
+  width: 100%;
+  height: 48px;
+  padding: 0 55px 0 14px;
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  font-size: 18px;
+  box-sizing: border-box;
+}
+.visibility-button {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 36px;
+  height: 36px;
+  padding: 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+.visibility-button img { width: 28px; height: 28px; }
+.connect-button {
+  display: block;
+  width: 100%;
+  height: 50px;
+  border: none;
+  border-radius: 8px;
+  background: #4CAF50;
+  color: #fff;
+  font-size: 18px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.connect-button:disabled { background: #aaa; cursor: default; }
+.back-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 45px;
+  margin-top: 12px;
+  border: none;
+  background: transparent;
+  font-size: 16px;
+  color: #777;
+  text-decoration: none;
+}
+.hidden { display: none !important; }

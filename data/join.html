@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8">
+  <title>WIFI NETWORK DETAIL</title>
+  <link rel="stylesheet" href="/style.css">
+  <script>
+    function togglePassword() {
+      const input = document.getElementById('password');
+      const icon = document.getElementById('visibilityIcon');
+      if (input.type === 'password') {
+        input.type = 'text';
+        icon.src = '/invisible.png';
+      } else {
+        input.type = 'password';
+        icon.src = '/visible.png';
+      }
+    }
+
+    async function connectWiFi() {
+      const button = document.getElementById('connectButton');
+      const passwordInput = document.getElementById('password');
+      const password = passwordInput ? passwordInput.value : '';
+      const ssid = document.getElementById('ssidValue').value;
+      
+      button.disabled = true;
+      button.textContent = 'Connecting...';
+      
+      const body = 'ssid=' + encodeURIComponent(ssid) + '&password=' + encodeURIComponent(password);
+      try {
+        await fetch('/connect', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: body
+        });
+      } catch(e) {}
+      
+      setTimeout(function() {
+        window.location.href = 'http://192.168.4.1/';
+      }, 18000);
+    }
+  </script>
+</head>
+<body>
+  <h1 class="detail-title">WIFI NETWORK DETAIL</h1>
+  <h3 class="ssid-header"><!-- SSID_PLACEHOLDER --></h3>
+
+  <form onsubmit="event.preventDefault(); connectWiFi();">
+    <input type="hidden" id="ssidValue" value="<!-- SSID_PLAIN_PLACEHOLDER -->">
+    
+    <div id="passwordField" class="<!-- PASSWORD_CLASS_PLACEHOLDER -->">
+      <label class="password-label" for="password">Password</label>
+      <div class="password-container">
+        <input id="password" class="password-input" type="password" autocomplete="off">
+        <button class="visibility-button" type="button" onclick="togglePassword()">
+          <img id="visibilityIcon" src="/visible.png" alt="Show">
+        </button>
+      </div>
+    </div>
+
+    <button id="connectButton" class="connect-button" type="submit">Connect</button>
+    <a href="/" class="back-button">Back</a>
+  </form>
+</body>
+</html>
