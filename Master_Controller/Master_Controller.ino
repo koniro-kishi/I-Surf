@@ -6,6 +6,9 @@
 #include <string.h>
 #include <vector>
 #include <LittleFS.h>
+#include <Preferences.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 
 /* =====================================================
    CONFIGURATION
@@ -15,6 +18,7 @@
 #define WIFI_INTERFACE WIFI_IF_STA
 #define STAT_INTERVAL 10000 // 10 sec
 #define POLL_INTERVAL 5000  // 5 sec
+#define NVS_NAMESPACE "saved_slave"
 
 /* =====================================================
    MESSAGE TYPES
@@ -41,7 +45,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
   uint8_t senderMacAddr[6];     
   uint8_t msgType;
-  int slaveID;                
+  uint8_t slaveID;                
 } master_confirm;
 
 // 2. Master requesting slave for reading reports
@@ -85,17 +89,26 @@ typedef struct __attribute__((packed)) {
   bool isPumpActive;
 } misting_reading;
 
+
 /* =====================================================
    SLAVE INFORMATION
    ===================================================== */
 
 struct SlaveInfo {
   uint8_t mac[6];
-  uint16_t slaveID;
+  uint8_t slaveID;
   String slaveType;
 };
 
+// because nvs cannot be multilevel, so it is stored as
+// key:value --> slaveID(string):macAddr(string)
+struct slaveID_to_macAddr {
+  uint8_t slaveID;
+  uint8_t macAddr[6];
+};
+
 std::vector<SlaveInfo> slaves;
+std::vector<slaveID_to_macAddr> savedSlaves;
 
 /* =====================================================
    GLOBAL VARIABLES
@@ -289,6 +302,112 @@ bool addSlavePeer(const uint8_t *mac) {
 }
 
 // =====================================================
+// NVS SAVED SLAVES
+// =====================================================
+
+String macToString(const uint8_t *mac) {
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(buf);
+}
+
+bool stringToMac(const String &str, uint8_t *mac) {
+  unsigned int b[6];
+  if (sscanf(str.c_str(), "%2x:%2x:%2x:%2x:%2x:%2x",
+             &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) {
+    return false;
+  }
+  for (int i = 0; i < 6; i++) mac[i] = (uint8_t)b[i];
+  return true;
+}
+
+// Load all saved slaves from NVS into savedSlaves
+void exportSavedSlaves() {
+  savedSlaves.clear();
+
+  Preferences prefs;
+  // read-write so the namespace is created on first boot
+  if (!prefs.begin(NVS_NAMESPACE, false)) {
+    Serial.println("Failed to open NVS namespace.");
+    return;
+  }
+
+  nvs_iterator_t it = NULL;
+  esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_NAMESPACE, NVS_TYPE_STR, &it);
+
+  while (err == ESP_OK && it != NULL) {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+
+    int id = atoi(info.key);
+    String macStr = prefs.getString(info.key, "");
+
+    slaveID_to_macAddr entry = {};
+    if (id >= 1 && id <= 255 && stringToMac(macStr, entry.macAddr)) {
+      entry.slaveID = (uint8_t)id;
+      savedSlaves.push_back(entry);
+      Serial.printf("Loaded saved slave #%d: %s\n", id, macStr.c_str());
+    } else {
+      Serial.printf("Skipping invalid NVS entry: key=%s\n", info.key);
+    }
+
+    err = nvs_entry_next(&it);   // sets it = NULL when no more entries
+  }
+
+  if (it) nvs_release_iterator(it);
+  prefs.end();
+}
+
+// Returns saved slaveID for this MAC, or -1 if not saved
+int isSlaveSaved(const uint8_t *mac) {
+  for (const auto &s : savedSlaves) {
+    if (memcmp(s.macAddr, mac, 6) == 0) return s.slaveID;
+  }
+  return -1;
+}
+
+// max(ID) + 1, or -1 if the ID space (uint8_t) is full
+int getNextSlaveID() {
+  int maxID = 0;
+  for (const auto &s : savedSlaves) {
+    if (s.slaveID > maxID) maxID = s.slaveID;
+  }
+  return (maxID >= 255) ? -1 : maxID + 1;
+}
+
+// Persist a new slave to NVS and to savedSlaves
+bool saveSlave(uint8_t id, const uint8_t *mac) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_NAMESPACE, false)) return false;
+
+  char key[4];
+  snprintf(key, sizeof(key), "%u", id);
+
+  size_t written = prefs.putString(key, macToString(mac));
+  prefs.end();
+
+  if (written == 0) return false;
+
+  slaveID_to_macAddr entry = {};
+  entry.slaveID = id;
+  memcpy(entry.macAddr, mac, 6);
+  savedSlaves.push_back(entry);
+  return true;
+}
+
+// Send master_confirm to a slave
+void sendConfirm(const uint8_t *mac, uint8_t id) {
+  master_confirm confirmMessage = {};
+  WiFi.macAddress(confirmMessage.senderMacAddr);
+  confirmMessage.msgType = MSG_MASTER_CONFIRM;
+  confirmMessage.slaveID = id;
+
+  esp_err_t result = esp_now_send(mac, (uint8_t *)&confirmMessage, sizeof(confirmMessage));
+  Serial.printf("Confirmation status: %s\n", esp_err_to_name(result));
+}
+
+// =====================================================
 // PAGE RENDERERS
 // =====================================================
 
@@ -372,7 +491,6 @@ void startSoftAP() {
 bool connectToTargetWiFi() {
   Serial.println("\nConnecting to: " + routerSSID);
   WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
 
   if (routerPassword.length() == 0) WiFi.begin(routerSSID.c_str());
   else WiFi.begin(routerSSID.c_str(), routerPassword.c_str());
@@ -494,10 +612,27 @@ void onDiscSlave(const esp_now_recv_info_t *info, const uint8_t *incomingData, i
     searchMessage.slaveType
   );
 
-  // Check if the slave is already in slaves vector
-  if (isSlaveRegistered(info->src_addr)) {
-    Serial.println("Slave already registered.");
-    return;
+  // Already registered in RAM (e.g. slave lost master and re-broadcasted):
+  // resend confirmation with the same ID, otherwise the slave waits forever
+  for (const auto &s : slaves) {
+    if (memcmp(s.mac, info->src_addr, 6) == 0) {
+      Serial.println("Slave already registered. Resending confirmation.");
+      sendConfirm(s.mac, s.slaveID);
+      return;
+    }
+  }
+
+  // Check NVS list: reuse the saved ID, or allocate a new one
+  int savedID = isSlaveSaved(info->src_addr);
+  bool isNewSlave = (savedID < 0);
+  int assignedID = savedID;
+
+  if (isNewSlave) {
+    assignedID = getNextSlaveID();
+    if (assignedID < 0) {
+      Serial.println("Slave ID space is full.");
+      return;
+    }
   }
 
   // Try to add slave as a peer
@@ -506,37 +641,21 @@ void onDiscSlave(const esp_now_recv_info_t *info, const uint8_t *incomingData, i
     return;
   }
 
-  // Store the information of the new slave
+  // New slave: persist to NVS (only after the peer was added successfully)
+  if (isNewSlave && !saveSlave((uint8_t)assignedID, info->src_addr)) {
+    Serial.println("Failed to save slave to NVS.");
+    return;
+  }
+
+  // Store the information of the slave in RAM
   SlaveInfo newSlave = {};
-
   memcpy(newSlave.mac, info->src_addr, 6);
-  newSlave.slaveID = slaves.size() + 1;
+  newSlave.slaveID = (uint8_t)assignedID;
   newSlave.slaveType = String(searchMessage.slaveType);
-
   slaves.push_back(newSlave);
 
-  // Create confirmation message
-  master_confirm confirmMessage = {};
-
-  WiFi.macAddress(confirmMessage.senderMacAddr);
-
-  confirmMessage.msgType = MSG_MASTER_CONFIRM;
-  confirmMessage.slaveID = newSlave.slaveID;
-
-  // Try to send the confirmation message
-  esp_err_t result = esp_now_send(newSlave.mac, (uint8_t *)&confirmMessage, sizeof(confirmMessage));
-
-  Serial.printf(
-    "Confirmation status: %s\n",
-    esp_err_to_name(result)
-  );
-
-  if (result == ESP_OK) {
-    Serial.printf(
-      "Successfully registered Slave #%d\n",
-      newSlave.slaveID
-    );
-  }
+  Serial.printf("Registered Slave #%d (%s)\n", newSlave.slaveID, isNewSlave ? "new" : "saved");
+  sendConfirm(newSlave.mac, newSlave.slaveID);
 }
 
 /* =====================================================
@@ -683,6 +802,12 @@ void setup() {
       delay(1000);
     }
   }
+
+  slaves.reserve(8);        // avoid reallocation while loop() iterates (see note 2)
+  savedSlaves.reserve(8);
+
+  exportSavedSlaves();
+  Serial.printf("Saved slaves in NVS: %d\n", savedSlaves.size());
 
   Serial.println("ESP-NOW initialized.");
   Serial.println("Receive callback registered.");
