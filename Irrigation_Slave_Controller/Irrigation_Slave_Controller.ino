@@ -9,6 +9,9 @@
 #define DEFAULT_SLAVE_CHANNEL 1
 #define SLAVE_TYPE "Irrigation"
 #define DEBUG_INTERVAL 10000 // 10 secs
+#define REQ_INT 15000   // ms; 3x master POLL_INTERVAL (5000)
+
+/* === MESSAGE TYPES ==== */
 
 #define MSG_SEARCH_MASTER 0
 #define MSG_MASTER_CONFIRM 1
@@ -28,7 +31,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
   uint8_t senderMacAddr[6];     
   uint8_t msgType;
-  int slaveID;                
+  uint8_t slaveID;                
 } master_confirm;
 
 // 2. Master requesting slave for reading reports
@@ -63,7 +66,7 @@ typedef struct __attribute__((packed)) {
 /* === GLOBAL VARIABLES === */
 
 uint8_t master_mac[6] = {0};
-uint16_t slaveID = 0;
+uint8_t slaveID = 0;
 
 volatile bool master_found = false;     // safely used in the background
 volatile bool received_confirm = false;
@@ -71,6 +74,7 @@ uint8_t current_scan_channel;
 uint8_t active_channel;
 
 bool master_peer_added = false;
+volatile unsigned long lastRequestTime = 0;
 
 // Dummy sensor data
 bool isPumpActive = true;
@@ -142,6 +146,37 @@ bool sendToMaster(const uint8_t *data, size_t length) {
   return result == ESP_OK;
 }
 
+void searchMaster() {
+  static const uint8_t broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+  // drop stale master peer (master may have rebooted on another channel)
+  if (esp_now_is_peer_exist(master_mac)) esp_now_del_peer(master_mac);
+  memset(master_mac, 0, 6);
+
+  search_master searchMessage = {};
+  WiFi.macAddress(searchMessage.senderMacAddr);
+  searchMessage.msgType = MSG_SEARCH_MASTER;
+  strncpy(searchMessage.slaveType, SLAVE_TYPE, sizeof(searchMessage.slaveType) - 1);
+
+  // start from the last known channel when re-searching
+  current_scan_channel = (active_channel != 0) ? active_channel : DEFAULT_SLAVE_CHANNEL;
+
+  while (!master_found) {
+    WiFi.setChannel(current_scan_channel);
+    Serial.printf("Broadcasting search on channel %d...\n", current_scan_channel);
+
+    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&searchMessage, sizeof(searchMessage));
+    Serial.printf("Broadcast status: %s\n", esp_err_to_name(result));
+
+    for (int i = 0; i < 10 && !master_found; i++) delay(100);
+    if (master_found) break;
+
+    current_scan_channel = (current_scan_channel % 13) + 1;
+  }
+
+  lastRequestTime = millis();
+}
+
 
 
 /* =====================================================
@@ -167,7 +202,7 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
   Serial.println();
 
   memcpy(master_mac, senderMac, 6);
-  slaveID = confirmMessage.slaveID;
+  slaveID = confirmMessage.e;
   active_channel = current_scan_channel;
 
   // Adding the master to ESP-NOW peer table
@@ -178,6 +213,7 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
 
   master_found = true;
   received_confirm = true;
+  lastRequestTime = millis();   // grace period after (re)registration
 
   Serial.printf("Slave ID: %d\n", slaveID);
 
@@ -193,6 +229,9 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
     Serial.println("Invalid master_request size");
     return;
   }
+
+  // reset the timer for request
+  lastRequestTime = millis();
 
   // create request message
   master_request request;
@@ -360,45 +399,8 @@ void setup() {
     );
   }
 
-  // create the search message
-  search_master searchMessage = {};
-
-  WiFi.macAddress(searchMessage.senderMacAddr);
-  
-  searchMessage.msgType = MSG_SEARCH_MASTER;
-  
-  strncpy(searchMessage.slaveType, SLAVE_TYPE, sizeof(searchMessage.slaveType) - 1);
-
-
-  // channel hopping loop
-
-  current_scan_channel = DEFAULT_SLAVE_CHANNEL;
-
-  while (!master_found) {
-    
-    WiFi.setChannel(current_scan_channel);
-
-    Serial.printf("Broadcasting search on channel %d...\n", current_scan_channel);
-
-    // sending a message to broadcast address (broadcasting the message)
-    result = esp_now_send(broadcastAddress, (uint8_t *)&searchMessage, sizeof(searchMessage));
-
-    Serial.printf("Broadcast status: %s\n", esp_err_to_name(result));
-
-    /*
-       Callback onDataRecv can still be running while this process is on going
-    */
-
-    for (int i = 0; i < 10 && !master_found; i++) {
-      delay(100);
-    }
-
-    if(master_found){
-      break;
-    }
-
-    current_scan_channel = (current_scan_channel % 13) + 1;
-  }
+  // search for master by broadcasting while channel hopping
+  searchMaster();
 
   Serial.println("\nConnected to Master!");
   Serial.println("Starting normal operation...");
@@ -409,6 +411,14 @@ void setup() {
    ===================================================== */
 
 void loop() {
+  // condition: master was registered but after some time doesnt get request
+  // potential cause: master or router reboot and changes it channel
+  if (master_found && millis() - lastRequestTime >= REQ_INT) {
+    Serial.println("No master request within REQ_INT. Searching master again...");
+    master_found = false;
+    searchMaster();
+  }
+
   static unsigned long lastDebug = 0;
 
   // print debug each interval of DEBUG_INTERVAL sec
