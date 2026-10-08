@@ -18,7 +18,11 @@
 #define WIFI_INTERFACE WIFI_IF_STA
 #define STAT_INTERVAL 10000 // 10 sec
 #define POLL_INTERVAL 5000  // 5 sec
-#define NVS_NAMESPACE "saved_slave"
+#define NVS_SLAVE_NAMESPACE "saved_slave"
+#define NVS_CRED_NAMESPACE "saved_cred"
+#define TRY_CONNECT_WINDOW 15000    // 15 sec
+#define SOFTAP_WINDOW      300000   // 5 min
+#define OFFLINE_CHANNEL    1        // sama dengan DEFAULT_SLAVE_CHANNEL di slave
 
 /* =====================================================
    MESSAGE TYPES
@@ -117,9 +121,32 @@ std::vector<slaveID_to_macAddr> savedSlaves;
 WiFiServer server(80);
 String routerSSID = "";
 String routerPassword = "";
-bool connectedToWifi = false;
 
 uint8_t active_channel = 0;
+
+enum class WifiState : uint8_t {
+  IDLE,
+  TRYING,
+  RUNNING_SOFTAP,
+  CONNECTED,
+  FAILED,          // gagal connect ke kredensial tersimpan
+  NO_REGISTERED    // softAP_window habis / tidak ada kredensial
+};
+
+// volatile: ditulis dari event task WiFi, dibaca dari loop task
+volatile WifiState wifiFlag = WifiState::IDLE;
+
+const char* wifiStateName(WifiState s) {
+  switch (s) {
+    case WifiState::IDLE:           return "IDLE";
+    case WifiState::TRYING:         return "TRYING";
+    case WifiState::RUNNING_SOFTAP: return "RUNNING_SOFTAP";
+    case WifiState::CONNECTED:      return "CONNECTED";
+    case WifiState::FAILED:         return "FAILED";
+    case WifiState::NO_REGISTERED:  return "NO_REGISTERED";
+  }
+  return "?";
+}
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
@@ -328,13 +355,13 @@ void exportSavedSlaves() {
 
   Preferences prefs;
   // read-write so the namespace is created on first boot
-  if (!prefs.begin(NVS_NAMESPACE, false)) {
+  if (!prefs.begin(NVS_SLAVE_NAMESPACE, false)) {
     Serial.println("Failed to open NVS namespace.");
     return;
   }
 
   nvs_iterator_t it = NULL;
-  esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_NAMESPACE, NVS_TYPE_STR, &it);
+  esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_SLAVE_NAMESPACE, NVS_TYPE_STR, &it);
 
   while (err == ESP_OK && it != NULL) {
     nvs_entry_info_t info;
@@ -379,7 +406,7 @@ int getNextSlaveID() {
 // Persist a new slave to NVS and to savedSlaves
 bool saveSlave(uint8_t id, const uint8_t *mac) {
   Preferences prefs;
-  if (!prefs.begin(NVS_NAMESPACE, false)) return false;
+  if (!prefs.begin(NVS_SLAVE_NAMESPACE, false)) return false;
 
   char key[4];
   snprintf(key, sizeof(key), "%u", id);
@@ -442,7 +469,7 @@ void renderIndexPage(WiFiClient& client) {
       if (!isOpen) {
         listHtml += "<img class=\"lock-icon\" src=\"/locked.png\" alt=\"Locked\">";
       }
-      listHtml += "a></div>";
+      listHtml += "</a></div>";
     }
   }
 
@@ -488,27 +515,77 @@ void startSoftAP() {
   Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
 }
 
-bool connectToTargetWiFi() {
+void onWiFiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP && wifiFlag == WifiState::TRYING) {
+    wifiFlag = WifiState::CONNECTED;
+  }
+}
+
+// true jika ada SSID tersimpan. SSID kosong = belum ada kredensial.
+bool loadCredentials(String &ssid, String &pass) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_CRED_NAMESPACE, false)) {
+    Serial.println("Failed to open credential NVS.");
+    return false;
+  }
+  ssid = prefs.getString("saved_SSID", "");
+  pass = prefs.getString("saved_password", "");
+  prefs.end();
+  return ssid.length() > 0;
+}
+
+bool saveCredentials(const String &ssid, const String &pass) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_CRED_NAMESPACE, false)) return false;
+
+  // hindari tulis flash jika tidak berubah
+  if (prefs.getString("saved_SSID", "") != ssid ||
+      prefs.getString("saved_password", "") != pass) {
+    prefs.putString("saved_SSID", ssid);
+    prefs.putString("saved_password", pass);
+  }
+
+  // verifikasi lewat read-back, bukan return value putString
+  bool ok = (prefs.getString("saved_SSID", "") == ssid) &&
+            (prefs.getString("saved_password", "") == pass);
+  prefs.end();
+
+  Serial.println(ok ? "Credentials saved." : "Failed to save credentials.");
+  return ok;
+}
+
+// revertToSoftAP = true  : dipanggil dari SoftAP (gagal -> AP dinyalakan lagi)
+// revertToSoftAP = false : dipanggil dari kredensial NVS (gagal -> FAILED)
+bool connectToTargetWiFi(bool revertToSoftAP) {
   Serial.println("\nConnecting to: " + routerSSID);
-  WiFi.softAPdisconnect(true);
+  wifiFlag = WifiState::TRYING;
+
+  if (revertToSoftAP) WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
 
   if (routerPassword.length() == 0) WiFi.begin(routerSSID.c_str());
   else WiFi.begin(routerSSID.c_str(), routerPassword.c_str());
 
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(500);
-    Serial.print(".");
+  while (wifiFlag == WifiState::TRYING && millis() - start < TRY_CONNECT_WINDOW) {
+    delay(100);
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+  if (wifiFlag == WifiState::CONNECTED) {
+    Serial.println("Connected! IP: " + WiFi.localIP().toString());
     return true;
   }
 
-  Serial.println("\nFailed to connect. Reverting to SoftAP...");
+  Serial.println("Failed to connect.");
   WiFi.disconnect(true);
-  startSoftAP();
+
+  if (revertToSoftAP) {
+    Serial.println("Reverting to SoftAP...");
+    startSoftAP();
+    wifiFlag = WifiState::RUNNING_SOFTAP;
+  } else {
+    wifiFlag = WifiState::FAILED;
+  }
   return false;
 }
 
@@ -569,7 +646,7 @@ void runSoftAP() {
     delay(100);
     client.stop();
 
-    connectedToWifi = connectToTargetWiFi();
+    connectToTargetWiFi(true);
   } 
   else if (requestLine.startsWith("GET / ") || requestLine.startsWith("GET /scan")) {
     renderIndexPage(client);
@@ -581,6 +658,55 @@ void runSoftAP() {
   if (client.connected()) client.stop();
 }
 
+void setupWifi() {
+  WiFi.onEvent(onWiFiEvent);
+
+  // 1. Ada kredensial tersimpan -> coba connect
+  String savedSSID, savedPass;
+  if (loadCredentials(savedSSID, savedPass)) {
+    routerSSID = savedSSID;
+    routerPassword = savedPass;
+    connectToTargetWiFi(false);   // hasil: CONNECTED atau FAILED
+    return;
+  }
+
+  // 2. Tidak ada -> SoftAP
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS mount failed!");
+    wifiFlag = WifiState::NO_REGISTERED;
+    return;
+  }
+
+  wifiFlag = WifiState::RUNNING_SOFTAP;
+  startSoftAP();
+  server.begin();
+  Serial.println("Web server ready.");
+
+  unsigned long softAPStart = millis();
+  while (wifiFlag == WifiState::RUNNING_SOFTAP &&
+         millis() - softAPStart < SOFTAP_WINDOW) {
+    runSoftAP();
+    // perpanjang window selama ada klien terhubung ke AP
+    if (WiFi.softAPgetStationNum() > 0) softAPStart = millis();
+  }
+
+  if (wifiFlag == WifiState::CONNECTED) {
+    saveCredentials(routerSSID, routerPassword);
+  } else {
+    wifiFlag = WifiState::NO_REGISTERED;
+  }
+}
+
+// Mode offline: tanpa router, ESP-NOW tetap jalan di channel tetap
+void goOffline() {
+  WiFi.softAPdisconnect(true);
+  WiFi.setAutoReconnect(false);   // cegah radio pindah channel diam-diam
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false);
+  esp_wifi_set_channel(OFFLINE_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  active_channel = OFFLINE_CHANNEL;
+  Serial.printf("Offline mode, ESP-NOW channel: %d\n", active_channel);
+}
 
 /* =====================================================
    SLAVE DISCOVERY
@@ -750,31 +876,21 @@ void setup() {
     WiFi module initialization
   */
 
-   // Initialize the WiFi module
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS mount failed!");
-    return;
+  setupWifi();
+
+  if (wifiFlag == WifiState::CONNECTED) {
+    printDoubleLog("Connected to Wifi", routerSSID.c_str(), 0);
+    active_channel = WiFi.channel();
+    Serial.printf("Wi-Fi channel: %d\n", active_channel);
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    goOffline();
+    printDoubleLog("Offline mode", wifiStateName(wifiFlag), 0);
   }
-
-  startSoftAP();
-  server.begin();
-  Serial.println("Web server ready.");
-
-  while(!connectedToWifi) runSoftAP();
-
-  printDoubleLog("Connected to Wifi", routerSSID.c_str(), 0);
-
-  // Storing the wifi channel
-  active_channel = WiFi.channel();
-
-  Serial.println("Wi-Fi connected.");
-  Serial.printf("Wi-Fi channel: %d\n", active_channel);
 
   Serial.print("Master MAC: ");
   Serial.println(WiFi.macAddress());
-
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
 
   /*
      ESP-NOW initialization
@@ -846,7 +962,7 @@ void setup() {
   //   );
   // }
 
-  printSingleLog("Master online", 2000);
+  printSingleLog("Master ready", 2000);
 
   Serial.println("Setup complete.");
 }
@@ -874,6 +990,10 @@ void loop() {
     Serial.println("\n=== MASTER STATUS ===");
 
     Serial.printf("Registered slaves: %d\n", slaves.size());
+
+    Serial.printf("Mode: %s\n", wifiFlag == WifiState::CONNECTED ? "ONLINE" : "OFFLINE");
+    
+    Serial.printf("WiFi state: %s\n", wifiStateName(wifiFlag));
 
     Serial.printf("Channel: %d\n", active_channel);
   }
