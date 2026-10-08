@@ -202,7 +202,7 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
   Serial.println();
 
   memcpy(master_mac, senderMac, 6);
-  slaveID = confirmMessage.e;
+  slaveID = confirmMessage.slaveID;
   active_channel = current_scan_channel;
 
   // Adding the master to ESP-NOW peer table
