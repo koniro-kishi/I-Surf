@@ -9,6 +9,7 @@
 #include <Preferences.h>
 #include <nvs.h>
 #include <nvs_flash.h>
+#include <time.h>
 
 /* =====================================================
    CONFIGURATION
@@ -122,6 +123,8 @@ std::vector<slaveID_to_macAddr> savedSlaves;
 // GLOBAL VARIABLES
 // =====================================================
 
+// Wifi connection variables
+
 WiFiServer server(80);
 String routerSSID = "";
 String routerPassword = "";
@@ -161,6 +164,16 @@ unsigned long wifiRetryStart = 0;    // awal percobaan yang sedang berjalan
 unsigned long softApPhaseStart = 0;  // awal fase ON/OFF SoftAP
 bool softApServerStarted = false;
 WifiState lastHandledFlag = WifiState::IDLE;
+
+
+// time synchronization
+
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 0;
+const int   daylightOffset_sec = 3600;
+struct tm timeinfo;
+
+// I2C module
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
@@ -532,6 +545,7 @@ void startSoftAP() {
 void onWiFiEvent(arduino_event_id_t event, arduino_event_info_t info) {
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP && wifiFlag == WifiState::TRYING) {
     wifiFlag = WifiState::CONNECTED;
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   }
   else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     uint8_t reason = info.wifi_sta_disconnected.reason;
@@ -1164,6 +1178,13 @@ void loop() {
     lastStatus = millis();
 
     Serial.println("\n=== MASTER STATUS ===");
+    if (wifiFlag == WifiState::CONNECTED) {
+      if(!getLocalTime(&timeinfo)){
+        Serial.println("Failed to obtain time");
+        return;
+      }
+      Serial.println(&timeinfo, "Timestamp: %A, %B %d %Y %H:%M:%S");
+    }
 
     Serial.printf("Registered slaves: %d\n", slaves.size());
 
@@ -1185,6 +1206,14 @@ void loop() {
     lastPolling = millis();
 
     Serial.println("\n=== POLLING SLAVES ===");
+    
+    if (wifiFlag == WifiState::CONNECTED) {
+      if(!getLocalTime(&timeinfo)){
+        Serial.println("Failed to obtain time");
+        return;
+      }
+      Serial.println(&timeinfo, "Timestamp: %A, %B %d %Y %H:%M:%S");
+    }
 
     // Poll to each slave
     for (auto &slave : slaves) {
