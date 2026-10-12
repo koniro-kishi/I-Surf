@@ -16,13 +16,17 @@
 #define apSSID "I-Surf Setup"
 #define apPassword "saya-berselancar"
 #define WIFI_INTERFACE WIFI_IF_STA
-#define STAT_INTERVAL 10000 // 10 sec
-#define POLL_INTERVAL 5000  // 5 sec
+#define STAT_INTERVAL 10000 // 10 sec; master prints its state
+#define POLL_INTERVAL 5000  // 5 sec; master sent polling request to slaves
 #define NVS_SLAVE_NAMESPACE "saved_slave"
 #define NVS_CRED_NAMESPACE "saved_cred"
-#define TRY_CONNECT_WINDOW 15000    // 15 sec
-#define SOFTAP_WINDOW      300000   // 5 min
+#define TRY_CONNECT_WINDOW 15000    // 15 sec; master trying to connect to a network
+#define SOFTAP_WINDOW      300000   // 5 min; master running softAP
 #define OFFLINE_CHANNEL    1        // sama dengan DEFAULT_SLAVE_CHANNEL di slave
+#define WIFI_RET_INTERVAL    120000  // 2 menit antar percobaan retry (state FAILED)
+#define WIFI_RET_TRY_WINDOW   10000  // 10 detik per percobaan retry
+#define WIFI_RET_LIMIT           10  // percobaan gagal berturut-turut (termasuk saat boot)
+#define SOFTAP_RET_WINDOW    300000  // 5 menit ON, 5 menit OFF (state NO_REGISTERED)
 
 /* =====================================================
    MESSAGE TYPES
@@ -114,9 +118,9 @@ struct slaveID_to_macAddr {
 std::vector<SlaveInfo> slaves;
 std::vector<slaveID_to_macAddr> savedSlaves;
 
-/* =====================================================
-   GLOBAL VARIABLES
-   ===================================================== */
+// =====================================================
+// GLOBAL VARIABLES
+// =====================================================
 
 WiFiServer server(80);
 String routerSSID = "";
@@ -147,6 +151,16 @@ const char* wifiStateName(WifiState s) {
   }
   return "?";
 }
+
+bool hardWifiLost = false;
+uint8_t noApFailCount = 0;                 
+volatile uint8_t lastDisconnectReason = 0; // 0 = belum ada alasan putus
+volatile bool authFailSeen = false;
+unsigned long wifiRetryLast = 0;     // akhir percobaan terakhir
+unsigned long wifiRetryStart = 0;    // awal percobaan yang sedang berjalan
+unsigned long softApPhaseStart = 0;  // awal fase ON/OFF SoftAP
+bool softApServerStarted = false;
+WifiState lastHandledFlag = WifiState::IDLE;
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
@@ -307,7 +321,7 @@ bool addSlavePeer(const uint8_t *mac) {
   esp_now_peer_info_t peerInfo = {};
 
   memcpy(peerInfo.peer_addr, mac, 6);
-  peerInfo.channel = active_channel;
+  peerInfo.channel = 0;
   peerInfo.ifidx = WIFI_IF_STA;
   peerInfo.encrypt = false;
 
@@ -511,13 +525,28 @@ void renderDetailPage(WiFiClient& client, const String& ssid, bool isOpen) {
 void startSoftAP() {
   Serial.println("Starting SoftAP...");
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(apSSID, apPassword);
+  WiFi.softAP(apSSID, apPassword, OFFLINE_CHANNEL);
   Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
 }
 
 void onWiFiEvent(arduino_event_id_t event, arduino_event_info_t info) {
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP && wifiFlag == WifiState::TRYING) {
     wifiFlag = WifiState::CONNECTED;
+  }
+  else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    uint8_t reason = info.wifi_sta_disconnected.reason;
+    if (reason == WIFI_REASON_ASSOC_LEAVE) return;   // akibat WiFi.disconnect() kita sendiri
+
+    if (wifiFlag == WifiState::TRYING) {
+      lastDisconnectReason = reason;
+      if (reason == WIFI_REASON_AUTH_FAIL) authFailSeen = true;
+    }
+    else if (wifiFlag == WifiState::CONNECTED) {
+      // koneksi yang sudah berjalan terputus: serahkan ke skema retry FAILED
+      Serial.printf("WiFi lost at runtime. Reason: %d\n", reason);
+      wifiRetryLast = millis();    // retry pertama setelah WIFI_RET_INTERVAL
+      wifiFlag = WifiState::FAILED;
+    }
   }
 }
 
@@ -554,20 +583,69 @@ bool saveCredentials(const String &ssid, const String &pass) {
   return ok;
 }
 
+void clearAttemptResult() {
+  lastDisconnectReason = 0;
+  authFailSeen = false;
+}
+
+void eraseCredentials() {
+  Preferences prefs;
+  if (prefs.begin(NVS_CRED_NAMESPACE, false)) {
+    prefs.clear();   // hanya namespace saved_cred
+    prefs.end();
+    Serial.println("Saved credentials erased.");
+  }
+  routerSSID = "";
+  routerPassword = "";
+}
+
+void giveUpOnSavedCredentials() {
+  hardWifiLost = true;
+  eraseCredentials();
+  noApFailCount = 0;
+  wifiFlag = WifiState::NO_REGISTERED;
+  softApPhaseStart = millis() - SOFTAP_RET_WINDOW;   // fase SoftAP ON langsung
+}
+
+// Dipanggil setelah percobaan dengan kredensial TERSIMPAN gagal (boot maupun retry).
+// Hasil: FAILED (retry berlanjut) atau NO_REGISTERED (NVS dihapus).
+void evaluateSavedCredFailure() {
+  Serial.printf("Connect failed. Disconnect reason: %d\n", lastDisconnectReason);
+
+  if (authFailSeen) {
+    Serial.println("AUTH_FAIL: wrong password.");
+    giveUpOnSavedCredentials();
+    return;
+  }
+
+  if (lastDisconnectReason == WIFI_REASON_NO_AP_FOUND) {
+    noApFailCount++;
+    Serial.printf("NO_AP_FOUND %d/%d\n", noApFailCount, WIFI_RET_LIMIT);
+    if (noApFailCount >= WIFI_RET_LIMIT) {
+      giveUpOnSavedCredentials();
+      return;
+    }
+  }
+
+  wifiFlag = WifiState::FAILED;
+  wifiRetryLast = millis();
+}
+
 // revertToSoftAP = true  : dipanggil dari SoftAP (gagal -> AP dinyalakan lagi)
 // revertToSoftAP = false : dipanggil dari kredensial NVS (gagal -> FAILED)
 bool connectToTargetWiFi(bool revertToSoftAP) {
   Serial.println("\nConnecting to: " + routerSSID);
   wifiFlag = WifiState::TRYING;
+  clearAttemptResult();
 
   if (revertToSoftAP) WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
 
   if (routerPassword.length() == 0) WiFi.begin(routerSSID.c_str());
   else WiFi.begin(routerSSID.c_str(), routerPassword.c_str());
 
   unsigned long start = millis();
-  while (wifiFlag == WifiState::TRYING && millis() - start < TRY_CONNECT_WINDOW) {
+  while (wifiFlag == WifiState::TRYING && !authFailSeen &&
+         millis() - start < TRY_CONNECT_WINDOW) {
     delay(100);
   }
 
@@ -577,7 +655,7 @@ bool connectToTargetWiFi(bool revertToSoftAP) {
   }
 
   Serial.println("Failed to connect.");
-  WiFi.disconnect(true);
+  WiFi.disconnect(false);
 
   if (revertToSoftAP) {
     Serial.println("Reverting to SoftAP...");
@@ -658,6 +736,99 @@ void runSoftAP() {
   if (client.connected()) client.stop();
 }
 
+void restoreOfflineChannel() {
+  esp_wifi_set_channel(OFFLINE_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  active_channel = OFFLINE_CHANNEL;
+}
+
+void stopSoftAP() {
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  restoreOfflineChannel();
+}
+
+// Dipanggil sekali saat wifiFlag berubah menjadi CONNECTED di loop()
+void onRuntimeConnected() {
+  active_channel = WiFi.channel();
+  noApFailCount = 0;
+  hardWifiLost = false;
+  WiFi.setAutoReconnect(true);              // samakan dengan jalur boot online
+  saveCredentials(routerSSID, routerPassword);  // no-op jika sama dengan yang tersimpan
+  Serial.printf("WiFi connected at runtime. Channel: %d\n", active_channel);
+}
+
+void handleWifiRetry() {
+  switch (wifiFlag) {
+
+    // --- FAILED: retry ke kredensial tersimpan ---
+    case WifiState::FAILED:
+      if (millis() - wifiRetryLast < WIFI_RET_INTERVAL) break;
+
+      Serial.printf("WiFi retry to %s (NO_AP_FOUND %d/%d)\n",
+                    routerSSID.c_str(), noApFailCount, WIFI_RET_LIMIT);
+      clearAttemptResult();
+      wifiFlag = WifiState::TRYING;
+      wifiRetryStart = millis();
+      if (routerPassword.length() == 0) WiFi.begin(routerSSID.c_str());
+      else WiFi.begin(routerSSID.c_str(), routerPassword.c_str());
+      break;
+
+    // --- TRYING: menunggu event GOT_IP atau timeout ---
+    case WifiState::TRYING:
+      // percobaan berakhir jika ada alasan putus atau timeout
+      if (lastDisconnectReason == 0 &&
+          millis() - wifiRetryStart < WIFI_RET_TRY_WINDOW) break;
+      if (wifiFlag != WifiState::TRYING) break;   // event GOT_IP masuk di sela-sela
+
+      evaluateSavedCredFailure();   // set flag dulu, supaya event putus berikutnya diabaikan
+      WiFi.disconnect(false);
+      restoreOfflineChannel();
+      break;
+
+    // --- NO_REGISTERED: SoftAP sedang OFF ---
+    case WifiState::NO_REGISTERED:
+      if (millis() - softApPhaseStart < SOFTAP_RET_WINDOW) break;
+
+      if (!LittleFS.begin(true)) {
+        Serial.println("LittleFS mount failed. Skipping SoftAP phase.");
+        softApPhaseStart = millis();
+        break;
+      }
+      startSoftAP();
+      if (!softApServerStarted) {
+        server.begin();
+        softApServerStarted = true;
+      }
+      wifiFlag = WifiState::RUNNING_SOFTAP;
+      softApPhaseStart = millis();
+      Serial.println("SoftAP phase: ON");
+      break;
+
+    // --- RUNNING_SOFTAP: SoftAP sedang ON ---
+    case WifiState::RUNNING_SOFTAP:
+      runSoftAP();
+      if (wifiFlag != WifiState::RUNNING_SOFTAP) break;   // runSoftAP berhasil connect
+
+      if (WiFi.softAPgetStationNum() > 0) {
+        softApPhaseStart = millis();                      // perpanjang selama ada klien
+      } else if (millis() - softApPhaseStart >= SOFTAP_RET_WINDOW) {
+        stopSoftAP();
+        wifiFlag = WifiState::NO_REGISTERED;
+        softApPhaseStart = millis();
+        Serial.println("SoftAP phase: OFF");
+      }
+      break;
+
+    default:
+      break;
+  }
+
+  if (wifiFlag == WifiState::CONNECTED && lastHandledFlag != WifiState::CONNECTED) {
+    onRuntimeConnected();
+  }
+  lastHandledFlag = wifiFlag;
+}
+
 void setupWifi() {
   WiFi.onEvent(onWiFiEvent);
 
@@ -667,6 +838,9 @@ void setupWifi() {
     routerSSID = savedSSID;
     routerPassword = savedPass;
     connectToTargetWiFi(false);   // hasil: CONNECTED atau FAILED
+    if (wifiFlag == WifiState::FAILED) {   // kegagalan saat boot dihitung sebagai percobaan ke-1
+      evaluateSavedCredFailure();
+    }
     return;
   }
 
@@ -680,6 +854,7 @@ void setupWifi() {
   wifiFlag = WifiState::RUNNING_SOFTAP;
   startSoftAP();
   server.begin();
+  softApServerStarted = true;
   Serial.println("Web server ready.");
 
   unsigned long softAPStart = millis();
@@ -888,6 +1063,7 @@ void setup() {
     goOffline();
     printDoubleLog("Offline mode", wifiStateName(wifiFlag), 0);
   }
+  lastHandledFlag = wifiFlag;
 
   Serial.print("Master MAC: ");
   Serial.println(WiFi.macAddress());
@@ -995,6 +1171,9 @@ void loop() {
     
     Serial.printf("WiFi state: %s\n", wifiStateName(wifiFlag));
 
+    Serial.printf("WiFi retry: %d/%d, hardWifiLost: %s\n",
+              noApFailCount, WIFI_RET_LIMIT, hardWifiLost ? "YES" : "NO");
+
     Serial.printf("Channel: %d\n", active_channel);
   }
 
@@ -1034,6 +1213,8 @@ void loop() {
       delay(100);
     }
   }
+
+  handleWifiRetry();
 
   delay(10);
 }
