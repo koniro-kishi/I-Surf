@@ -10,6 +10,7 @@
 #include <nvs.h>
 #include <nvs_flash.h>
 #include <time.h>
+#include <ArduinoJson.h>
 
 /* =====================================================
    CONFIGURATION
@@ -17,27 +18,34 @@
 #define apSSID "I-Surf Setup"
 #define apPassword "saya-berselancar"
 #define WIFI_INTERFACE WIFI_IF_STA
+
 #define STAT_INTERVAL 10000 // 10 sec; master prints its state
 #define POLL_INTERVAL 5000  // 5 sec; master sent polling request to slaves
+
 #define NVS_SLAVE_NAMESPACE "saved_slave"
 #define NVS_CRED_NAMESPACE "saved_cred"
+
 #define TRY_CONNECT_WINDOW 15000    // 15 sec; master trying to connect to a network
 #define SOFTAP_WINDOW      300000   // 5 min; master running softAP
 #define OFFLINE_CHANNEL    1        // sama dengan DEFAULT_SLAVE_CHANNEL di slave
+
 #define WIFI_RET_INTERVAL    120000  // 2 menit antar percobaan retry (state FAILED)
 #define WIFI_RET_TRY_WINDOW   10000  // 10 detik per percobaan retry
 #define WIFI_RET_LIMIT           10  // percobaan gagal berturut-turut (termasuk saat boot)
 #define SOFTAP_RET_WINDOW    300000  // 5 menit ON, 5 menit OFF (state NO_REGISTERED)
 
 /* =====================================================
-   MESSAGE TYPES
+   MESSAGE TYPES AND SIZE
    ===================================================== */
 
-#define MSG_SEARCH_MASTER 0
-#define MSG_MASTER_CONFIRM 1
-#define MSG_MASTER_REQUEST 2
-#define MSG_IRRIGATION_READING 3
-#define MSG_MISTING_READING 4
+#define MSG_SEARCH_MASTER   0
+#define MSG_MASTER_CONFIRM  1
+#define MSG_MASTER_REQUEST  2
+#define MSG_SLAVE_READING   3
+
+#define READING_PACKET_MAX  250   // batas payload ESP-NOW
+#define READING_HEADER_SIZE 24    // srcAddr(6)+msgType(1)+slaveID(1)+slaveType(16)
+#define REPORT_BUFFER_SIZE  (READING_PACKET_MAX - READING_HEADER_SIZE)  // 226
 
 /* =====================================================
    DATA STRUCTURES
@@ -45,59 +53,49 @@
 
 // 0. Slave searching for a master
 typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];     
+  uint8_t srcAddr[6];     
   uint8_t msgType;
   char slaveType[16];            
 } search_master;
 
 // 1. Master confirming slave is searching for master
 typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];     
+  uint8_t srcAddr[6];     
   uint8_t msgType;
   uint8_t slaveID;                
 } master_confirm;
 
 // 2. Master requesting slave for reading reports
 typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];  
+  uint8_t srcAddr[6];  
   uint8_t msgType;
-  uint8_t receiverMacAddr[6];
+  uint8_t dstAddr[6];
   uint8_t slaveID;
   char slaveType[16];
+  uint32_t reqTime;          // master millis() saat polling
 } master_request;
 
-// 3. Irrigation slave reading report
+// 3. Slave reading report
 typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];     
+  uint8_t srcAddr[6];     
   uint8_t msgType;
   uint8_t slaveID;
   char slaveType[16];
+  char reportBuffer[REPORT_BUFFER_SIZE];   // serialized JSON, null-terminated
+} slave_reading;
 
-  float soilMoist;
-  float waterPH;
-  float fertPH;
-  float waterTDS;
-  float fertTDS;
+static_assert(offsetof(slave_reading, reportBuffer) == READING_HEADER_SIZE, "header size mismatch");
+static_assert(sizeof(slave_reading) == READING_PACKET_MAX, "slave_reading must be 250 bytes");
 
-  bool isPumpActive;
-  bool isWaterValveActive;
-  bool isFertValveActive;
-} irrigation_reading;
+#define READING_QUEUE_DEPTH 20
 
-// 4. Misting slave reading report
-typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];     
-  uint8_t msgType;
-  uint8_t slaveID;
-  char slaveType[16];
+// reading queue
 
-  float airMoist;
-  float airTemp;
-  float lighting;
-
-  bool isPumpActive;
-} misting_reading;
-
+struct RxReading {
+  uint8_t  srcAddr[6];   // dari info->src_addr, bukan dari isi paket
+  uint16_t len;
+  slave_reading pkt;
+};
 
 /* =====================================================
    SLAVE INFORMATION
@@ -172,6 +170,12 @@ const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 0;
 const int   daylightOffset_sec = 3600;
 struct tm timeinfo;
+
+
+// other
+
+QueueHandle_t readingQueue = NULL;
+
 
 // I2C module
 
@@ -355,6 +359,22 @@ bool addSlavePeer(const uint8_t *mac) {
   return true;
 }
 
+void enqueueReading(const uint8_t *srcAddr, const uint8_t *data, int len) {
+  if (len <= READING_HEADER_SIZE || len > (int)sizeof(slave_reading)) {
+    Serial.println("Invalid slave_reading size.");
+    return;
+  }
+  RxReading item;
+  memcpy(item.srcAddr, srcAddr, 6);
+  item.len = len;
+  memset(&item.pkt, 0, sizeof(item.pkt));
+  memcpy(&item.pkt, data, len);
+
+  if (xQueueSend(readingQueue, &item, 0) != pdTRUE) {
+    Serial.println("Reading queue full. Packet dropped.");
+  }
+}
+
 // =====================================================
 // NVS SAVED SLAVES
 // =====================================================
@@ -453,7 +473,7 @@ bool saveSlave(uint8_t id, const uint8_t *mac) {
 // Send master_confirm to a slave
 void sendConfirm(const uint8_t *mac, uint8_t id) {
   master_confirm confirmMessage = {};
-  WiFi.macAddress(confirmMessage.senderMacAddr);
+  WiFi.macAddress(confirmMessage.srcAddr);
   confirmMessage.msgType = MSG_MASTER_CONFIRM;
   confirmMessage.slaveID = id;
 
@@ -977,38 +997,47 @@ void onDiscSlave(const esp_now_recv_info_t *info, const uint8_t *incomingData, i
    SENSOR READING HANDLER
    ===================================================== */
 
-void onRecvReading_Irrigation(const uint8_t *incomingData, int len) {
-  // Check if the message type is incorrectly assigned to the data
-  // So it is actually not a irrigation_reading data
-  if (len != sizeof(irrigation_reading)) {
-    Serial.println("Invalid irrigation_reading size.");
+void onRecvReading(RxReading &rItem) {
+  if (!isSlaveRegistered(rItem.srcAddr)) {
+    Serial.println("Reading from unregistered MAC. Dropped.");
     return;
   }
 
-  // Create irrigation reading message
-  irrigation_reading reading;
-  memcpy(&reading, incomingData,sizeof(reading));
+  // jangan percaya terminator dari pengirim
+  rItem.pkt.slaveType[sizeof(rItem.pkt.slaveType) - 1] = '\0';
+  rItem.pkt.reportBuffer[sizeof(rItem.pkt.reportBuffer) - 1] = '\0';
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, rItem.pkt.reportBuffer);
+  if (err) {
+    Serial.printf("Invalid report JSON: %s\n", err.c_str());
+    return;
+  }
+  JsonObject obj = doc.as<JsonObject>();
 
   Serial.println("\n==============================");
-  Serial.println("IRRIGATION READING RECEIVED");
+  Serial.println("SLAVE READING RECEIVED");
   Serial.println("==============================");
+  Serial.printf("Slave type: %s\n", rItem.pkt.slaveType);
+  Serial.printf("Slave ID: %d\n", rItem.pkt.slaveID);
 
-  Serial.printf("Slave type: %s\n", reading.slaveType);
-  Serial.printf("Slave ID: %d\n", reading.slaveID);
-  Serial.printf("Soil moisture: %.2f\n", reading.soilMoist);
-  Serial.printf("Water pH: %.2f\n", reading.waterPH);
-  Serial.printf("Water TDS: %.2f\n", reading.waterTDS);
-  Serial.printf("Water valve: %s\n", reading.isWaterValveActive ? "ON" : "OFF");
-  Serial.printf("Fertilizer pH: %.2f\n", reading.fertPH);
-  Serial.printf("Fertilizer TDS: %.2f\n", reading.fertTDS);
-  Serial.printf("Fertilizer valve: %s\n", reading.isFertValveActive ? "ON" : "OFF");
-  Serial.printf("Irrigation pump: %s\n", reading.isPumpActive ? "ON" : "OFF");
+  for (JsonPair kv : obj) {
+    Serial.print(kv.key().c_str());
+    Serial.print(": ");
+    serializeJson(kv.value(), Serial);
+    Serial.println();
+  }
 
-  // Message footer
   char line[17];
-  snprintf(line, sizeof(line), "Slave #%d", reading.slaveID);
+  snprintf(line, sizeof(line), "Slave #%d", rItem.pkt.slaveID);
+  printDoubleLog("Received from:", line);   // tanpa delay
+}
 
-  printDoubleLog("Received from:", line, 1000);
+void processReadingQueue() {
+  RxReading item;
+  while (xQueueReceive(readingQueue, &item, 0) == pdTRUE) {
+    onRecvReading(item);
+  }
 }
 
 /* =====================================================
@@ -1036,8 +1065,8 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
       onDiscSlave(info, incomingData, len);
       break;
 
-    case MSG_IRRIGATION_READING:
-      onRecvReading_Irrigation(incomingData, len);
+    case MSG_SLAVE_READING:
+      enqueueReading(info->src_addr, incomingData, len);
       break;
 
     default:
@@ -1095,6 +1124,13 @@ void setup() {
     while (true) {
       delay(1000);
     }
+  }
+
+  // Creating slave reading queue
+  readingQueue = xQueueCreate(READING_QUEUE_DEPTH, sizeof(RxReading));
+  if (readingQueue == NULL) {
+    Serial.println("Failed to create reading queue.");
+    while (true) delay(1000);
   }
 
   // Registering callbacks
@@ -1162,10 +1198,7 @@ void setup() {
    ===================================================== */
 
 void loop() {
-  // reconnect if master suddenly loose wifi connection to router
-  // if (WiFi.status() != WL_CONNECTED) {
-  //   WiFi.reconnect();
-  // }
+  processReadingQueue();
 
   static unsigned long lastPolling = 0;
   static unsigned long lastStatus = 0;
@@ -1219,16 +1252,12 @@ void loop() {
     for (auto &slave : slaves) {
       // create message
       master_request requestMessage = {};
-
-      WiFi.macAddress(requestMessage.senderMacAddr);
-      
+      WiFi.macAddress(requestMessage.srcAddr);
       requestMessage.msgType = MSG_MASTER_REQUEST;
-      
-      memcpy(requestMessage.receiverMacAddr, slave.mac, 6);
-      
+      memcpy(requestMessage.dstAddr, slave.mac, 6);
       requestMessage.slaveID = slave.slaveID;
-      
       strncpy(requestMessage.slaveType, slave.slaveType.c_str(), sizeof(requestMessage.slaveType) - 1);
+      requestMessage.reqTime = (uint32_t)lastPolling;   // satu timestamp per siklus polling
 
       Serial.printf("Requesting Slave #%d (", slave.slaveID);
       printMac(slave.mac);

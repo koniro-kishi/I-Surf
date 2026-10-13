@@ -3,6 +3,7 @@
 #include <esp_mac.h>
 #include <esp_wifi.h>
 #include <string.h>
+#include <ArduinoJson.h>
 
 /* === DEFINITIONS === */
 
@@ -11,57 +12,65 @@
 #define DEBUG_INTERVAL 10000 // 10 secs
 #define REQ_INT 15000   // ms; 3x master POLL_INTERVAL (5000)
 
+#define READING_PACKET_MAX  250   // batas payload ESP-NOW
+#define READING_HEADER_SIZE 24    // srcAddr(6)+msgType(1)+slaveID(1)+slaveType(16)
+#define REPORT_BUFFER_SIZE  (READING_PACKET_MAX - READING_HEADER_SIZE)  // 226
+
 /* === MESSAGE TYPES ==== */
 
-#define MSG_SEARCH_MASTER 0
-#define MSG_MASTER_CONFIRM 1
-#define MSG_MASTER_REQUEST 2
-#define MSG_IRRIGATION_READING 3
+#define MSG_SEARCH_MASTER   0
+#define MSG_MASTER_CONFIRM  1
+#define MSG_MASTER_REQUEST  2
+#define MSG_SLAVE_READING   3
 
 /* === STRUCTS === */
 
 // 0. Slave searching for a master
 typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];     
+  uint8_t srcAddr[6];     
   uint8_t msgType;
   char slaveType[16];            
 } search_master;
 
 // 1. Master confirming slave is searching for master
 typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];     
+  uint8_t srcAddr[6];     
   uint8_t msgType;
   uint8_t slaveID;                
 } master_confirm;
 
 // 2. Master requesting slave for reading reports
 typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];  
+  uint8_t srcAddr[6];  
   uint8_t msgType;
-  uint8_t receiverMacAddr[6];
+  uint8_t dstAddr[6];
   uint8_t slaveID;
   char slaveType[16];
+  uint32_t reqTime;          // master millis() saat polling
 } master_request;
 
-// 3. Irrigation slave reading report
+// 3. Slave reading report
 typedef struct __attribute__((packed)) {
-  uint8_t senderMacAddr[6];     
+  uint8_t srcAddr[6];
   uint8_t msgType;
   uint8_t slaveID;
   char slaveType[16];
+  char reportBuffer[REPORT_BUFFER_SIZE];   // serialized JSON, null-terminated
+} slave_reading;
 
+static_assert(offsetof(slave_reading, reportBuffer) == READING_HEADER_SIZE, "header size mismatch");
+static_assert(sizeof(slave_reading) == READING_PACKET_MAX, "slave_reading must be 250 bytes");
+
+struct SlaveState {
   float soilMoist;
   float waterPH;
   float fertPH;
   float waterTDS;
   float fertTDS;
-
-  bool isPumpActive;
-  bool isWaterValveActive;
-  bool isFertValveActive;
-} irrigation_reading;
-
-
+  bool  isPumpActive;
+  bool  isWaterValveActive;
+  bool  isFertValveActive;
+};
 
 /* === GLOBAL VARIABLES === */
 
@@ -77,14 +86,15 @@ bool master_peer_added = false;
 volatile unsigned long lastRequestTime = 0;
 
 // Dummy sensor data
-bool isPumpActive = true;
-float soilMoist = 0.9;
-float waterPH = 0.5;
-float waterTDS = 0.6;
-bool isWaterValveActive = false;
-float fertPH = 0.1;
-float fertTDS = 0.2;
-bool isFertValveActive = true;
+SlaveState slaveState = {0.9f, 0.5f, 0.1f, 0.6f, 0.2f, true, false, true};  // dummy
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Dipanggil dari loop() oleh kode pembacaan sensor nanti (belum dipanggil: data dummy)
+void updateSlaveState(const SlaveState &s) {
+  portENTER_CRITICAL(&stateMux);
+  slaveState = s;
+  portEXIT_CRITICAL(&stateMux);
+}
 
 
 
@@ -154,7 +164,7 @@ void searchMaster() {
   memset(master_mac, 0, 6);
 
   search_master searchMessage = {};
-  WiFi.macAddress(searchMessage.senderMacAddr);
+  WiFi.macAddress(searchMessage.srcAddr);
   searchMessage.msgType = MSG_SEARCH_MASTER;
   strncpy(searchMessage.slaveType, SLAVE_TYPE, sizeof(searchMessage.slaveType) - 1);
 
@@ -237,34 +247,51 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   master_request request;
 
   memcpy(&request, incomingData, sizeof(request));
+  uint32_t reqTime = request.reqTime;
 
   Serial.println("\n=== MASTER REQUEST RECEIVED ===");
-
   Serial.printf("Request for Slave ID: %d\n", request.slaveID);
 
+  // consistent snapshot of the last state (not guaranted to be the actual latest / current)
+  SlaveState s;
+  portENTER_CRITICAL(&stateMux);
+  s = slaveState;
+  portEXIT_CRITICAL(&stateMux);
+
   // create reading report message
-  irrigation_reading reading = {};
-
-  WiFi.macAddress(reading.senderMacAddr);
-  
-  reading.msgType = MSG_IRRIGATION_READING;
+  slave_reading reading = {};
+  WiFi.macAddress(reading.srcAddr);
+  reading.msgType = MSG_SLAVE_READING;
   reading.slaveID = slaveID;
-
   strncpy(reading.slaveType,SLAVE_TYPE,sizeof(reading.slaveType) - 1);
 
-  reading.isPumpActive = isPumpActive;
-  reading.soilMoist = soilMoist;
-  reading.waterPH = waterPH;
-  reading.fertPH = fertPH;
-  reading.waterTDS = waterTDS;
-  reading.fertTDS = fertTDS;
-  reading.isWaterValveActive = isWaterValveActive;
-  reading.isFertValveActive = isFertValveActive;
+  // create json report
+  JsonDocument report;
+  report["reqTime"]            = reqTime;
+  report["slaveID"]            = slaveID;
+  report["soilMoist"]          = s.soilMoist;
+  report["waterPH"]            = s.waterPH;
+  report["fertPH"]             = s.fertPH;
+  report["waterTDS"]           = s.waterTDS;
+  report["fertTDS"]            = s.fertTDS;
+  report["isPumpActive"]       = s.isPumpActive;
+  report["isWaterValveActive"] = s.isWaterValveActive;
+  report["isFertValveActive"]  = s.isFertValveActive;
+
+  size_t jsonLen = measureJson(report);
+  if (report.overflowed() || jsonLen >= sizeof(reading.reportBuffer)) {
+    Serial.printf("Report too large: %u/%u bytes. Not sent.\n",
+                  (unsigned)jsonLen, (unsigned)(sizeof(reading.reportBuffer) - 1));
+    return;
+  }
+  serializeJson(report, reading.reportBuffer, sizeof(reading.reportBuffer));
 
   // send the created message by unicast
-  sendToMaster((uint8_t *)&reading, sizeof(reading));
+  // header + JSON + '\0'
+  size_t packetLen = READING_HEADER_SIZE + jsonLen + 1;
+  sendToMaster((uint8_t *)&reading, packetLen);
 
-  Serial.println("Irrigation reading sent.");
+  Serial.printf("Reading sent (%u bytes): %s\n", (unsigned)packetLen, reading.reportBuffer);
 }
 
 /* =====================================================
