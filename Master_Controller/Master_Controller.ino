@@ -62,7 +62,8 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
   uint8_t srcAddr[6];     
   uint8_t msgType;
-  uint8_t slaveID;                
+  uint8_t slaveID;
+  uint8_t channel;                
 } master_confirm;
 
 // 2. Master requesting slave for reading reports
@@ -476,6 +477,13 @@ void sendConfirm(const uint8_t *mac, uint8_t id) {
   WiFi.macAddress(confirmMessage.srcAddr);
   confirmMessage.msgType = MSG_MASTER_CONFIRM;
   confirmMessage.slaveID = id;
+
+  // read current radio channel, not active channel variable that may be expired
+  uint8_t pri;
+  wifi_second_chan_t sec;
+  esp_wifi_get_channel(&pri, &sec);
+  confirmMessage.channel = pri;
+  active_channel = pri;
 
   esp_err_t result = esp_now_send(mac, (uint8_t *)&confirmMessage, sizeof(confirmMessage));
   Serial.printf("Confirmation status: %s\n", esp_err_to_name(result));
@@ -1228,7 +1236,11 @@ void loop() {
     Serial.printf("WiFi retry: %d/%d, hardWifiLost: %s\n",
               noApFailCount, WIFI_RET_LIMIT, hardWifiLost ? "YES" : "NO");
 
-    Serial.printf("Channel: %d\n", active_channel);
+    Serial.printf("Active channel: %d\n", active_channel);
+
+    uint8_t pri; wifi_second_chan_t sec;
+    esp_wifi_get_channel(&pri, &sec);
+    Serial.printf("Radio channel (actual): %d\n", pri);
   }
 
   /*

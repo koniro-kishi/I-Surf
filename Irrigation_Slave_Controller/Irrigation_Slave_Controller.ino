@@ -36,7 +36,8 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
   uint8_t srcAddr[6];     
   uint8_t msgType;
-  uint8_t slaveID;                
+  uint8_t slaveID;
+  uint8_t channel;                
 } master_confirm;
 
 // 2. Master requesting slave for reading reports
@@ -121,7 +122,7 @@ bool addMasterPeer(const uint8_t *mac) {
   esp_now_peer_info_t peerInfo = {};
   
   memcpy(peerInfo.peer_addr, mac, 6);
-  peerInfo.channel = active_channel;
+  peerInfo.channel = 0; // current active channel
   peerInfo.ifidx = WIFI_IF_STA;
   peerInfo.encrypt = false;
 
@@ -184,6 +185,10 @@ void searchMaster() {
     current_scan_channel = (current_scan_channel % 13) + 1;
   }
 
+  // radio mungkin berhenti di channel tetangga (overlap); pindah ke channel master
+  esp_wifi_set_channel(active_channel, WIFI_SECOND_CHAN_NONE);
+  current_scan_channel = active_channel;
+
   lastRequestTime = millis();
 }
 
@@ -213,7 +218,7 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
 
   memcpy(master_mac, senderMac, 6);
   slaveID = confirmMessage.slaveID;
-  active_channel = current_scan_channel;
+  active_channel = confirmMessage.channel;
 
   // Adding the master to ESP-NOW peer table
   if (!addMasterPeer(master_mac)) {
@@ -469,7 +474,11 @@ void loop() {
 
     Serial.printf("Slave ID: %d\n", slaveID);
 
-    Serial.printf("Channel: %d\n", active_channel);
+    Serial.printf("Active channel: %d\n", active_channel);
+
+    uint8_t pri; wifi_second_chan_t sec;
+    esp_wifi_get_channel(&pri, &sec);
+    Serial.printf("Radio channel (actual): %d\n", pri);
   }
 
   delay(100);
