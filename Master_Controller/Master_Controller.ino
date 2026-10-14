@@ -1,4 +1,6 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <esp_now.h>
 #include <esp_mac.h>
 #include <esp_wifi.h>
@@ -33,6 +35,14 @@
 #define WIFI_RET_TRY_WINDOW   10000  // 10 detik per percobaan retry
 #define WIFI_RET_LIMIT           10  // percobaan gagal berturut-turut (termasuk saat boot)
 #define SOFTAP_RET_WINDOW    300000  // 5 menit ON, 5 menit OFF (state NO_REGISTERED)
+
+#define ENV_PATH            "/.env"
+#define COLLECT_TIMEOUT     2000     // ms; batas tunggu balasan sejak request terakhir dikirim
+#define CLOUD_HTTP_TIMEOUT  5000     // ms
+#define CLOUD_TASK_STACK    12288    // byte; cek dengan log stack di bawah
+#define SIGNIN_RETRY_MS     30000    // jeda setelah gagal jaringan / ditolak (401)
+#define SIGNIN_BAD_CRED_MS  300000   // jeda setelah HTTP 400 (kredensial atau konfigurasi salah)
+#define TOKEN_MARGIN_S      300      // login ulang 5 menit sebelum token kedaluwarsa
 
 /* =====================================================
    MESSAGE TYPES AND SIZE
@@ -91,12 +101,21 @@ static_assert(sizeof(slave_reading) == READING_PACKET_MAX, "slave_reading must b
 #define READING_QUEUE_DEPTH 20
 
 // reading queue
-
 struct RxReading {
   uint8_t  srcAddr[6];   // dari info->src_addr, bukan dari isi paket
   uint16_t len;
   slave_reading pkt;
 };
+
+// database login
+struct CloudConfig {
+  String apiKey;
+  String dbUrl;
+  String email;
+  String password;
+  bool valid = false;
+};
+CloudConfig cloudCfg;
 
 /* =====================================================
    SLAVE INFORMATION
@@ -173,9 +192,26 @@ const int   daylightOffset_sec = 3600;
 struct tm timeinfo;
 
 
-// other
-
+// read queue
 QueueHandle_t readingQueue = NULL;
+
+
+// Agregate report
+JsonDocument aggregate_rep;
+enum class CycleState : uint8_t { IDLE, COLLECTING };
+CycleState cycleState = CycleState::IDLE;
+uint32_t cycleReqTime = 0;
+unsigned long cycleSentAt = 0;
+size_t cycleExpected = 0;      // number of slave when the cycle start
+
+// Queue for task upload: item = char* in heap
+QueueHandle_t cloudQueue = NULL;
+static WiFiClientSecure dbClient;          // reused between request (keep-alive)
+static String cloudToken;
+static unsigned long cloudTokenAt = 0;
+static unsigned long cloudTokenTtlMs = 0;
+static unsigned long cloudLastFail = 0;
+static unsigned long cloudRetryDelay = 0;  // 0 = currently not waiting
 
 
 // I2C module
@@ -1006,7 +1042,8 @@ void onDiscSlave(const esp_now_recv_info_t *info, const uint8_t *incomingData, i
    ===================================================== */
 
 void onRecvReading(RxReading &rItem) {
-  if (!isSlaveRegistered(rItem.srcAddr)) {
+  int regID = findSlaveID(rItem.srcAddr);
+  if (regID < 0) {
     Serial.println("Reading from unregistered MAC. Dropped.");
     return;
   }
@@ -1035,6 +1072,8 @@ void onRecvReading(RxReading &rItem) {
     serializeJson(kv.value(), Serial);
     Serial.println();
   }
+
+  collectReading(regID, obj);
 
   char line[17];
   snprintf(line, sizeof(line), "Slave #%d", rItem.pkt.slaveID);
@@ -1083,6 +1122,262 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
   }
 }
 
+// =====================================================
+// CLOUD (RTDB lewat REST)
+// =====================================================
+
+bool loadCloudConfig() {
+  cloudCfg = CloudConfig();
+
+  File f = LittleFS.open(ENV_PATH, "r");
+  if (!f) {
+    Serial.println("Cloud: " ENV_PATH " not found. Upload disabled.");
+    return false;
+  }
+
+  bool first = true;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    if (first) {                          // buang BOM UTF-8 jika ada
+      if (line.startsWith("\xEF\xBB\xBF")) line.remove(0, 3);
+      first = false;
+    }
+    line.trim();                          // buang \r (CRLF Windows) dan spasi
+    if (line.length() == 0 || line[0] == '#') continue;
+
+    int eq = line.indexOf('=');
+    if (eq <= 0) continue;
+    String key = line.substring(0, eq);   key.trim();
+    String val = line.substring(eq + 1);  val.trim();
+    if (val.length() >= 2 && val[0] == '"' && val[val.length() - 1] == '"') {
+      val = val.substring(1, val.length() - 1);
+    }
+
+    if (key == "FIREBASE_API_KEY")          cloudCfg.apiKey = val;
+    else if (key == "FIREBASE_DATABASE_URL") cloudCfg.dbUrl = val;
+    else if (key == "DEVICE_EMAIL")          cloudCfg.email = val;
+    else if (key == "DEVICE_PASSWORD")       cloudCfg.password = val;
+  }
+  f.close();
+
+  while (cloudCfg.dbUrl.endsWith("/")) cloudCfg.dbUrl.remove(cloudCfg.dbUrl.length() - 1);
+
+  cloudCfg.valid = cloudCfg.apiKey.length() > 0 &&
+                   cloudCfg.dbUrl.startsWith("https://") &&
+                   cloudCfg.email.length() > 0 &&
+                   cloudCfg.password.length() > 0;
+
+  Serial.printf("Cloud: config %s\n", cloudCfg.valid ? "loaded" : "INCOMPLETE. Upload disabled.");
+  return cloudCfg.valid;
+}
+
+// Login email/password -> idToken. Backoff mencegah login berulang saat kredensial salah.
+bool cloudSignIn() {
+  if (cloudRetryDelay != 0 && millis() - cloudLastFail < cloudRetryDelay) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();   // TIDAK memverifikasi sertifikat server (keputusan sementara)
+  HTTPClient http;
+  http.setConnectTimeout(CLOUD_HTTP_TIMEOUT);
+  http.setTimeout(CLOUD_HTTP_TIMEOUT);
+
+  String url = String("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=")
+               + cloudCfg.apiKey;
+  if (!http.begin(client, url)) {
+    cloudLastFail = millis();
+    cloudRetryDelay = SIGNIN_RETRY_MS;
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+
+  JsonDocument req;
+  req["email"] = cloudCfg.email;
+  req["password"] = cloudCfg.password;
+  req["returnSecureToken"] = true;
+  String body;
+  serializeJson(req, body);
+
+  int code = http.POST(body);
+  String resp = (code > 0) ? http.getString() : String();
+  http.end();
+
+  JsonDocument res;
+  if (code == 200 && !deserializeJson(res, resp)) {
+    const char *tok = res["idToken"] | "";
+    long expiresIn = String(res["expiresIn"] | "3600").toInt();
+    if (tok[0] != '\0') {
+      cloudToken = tok;
+      long ttl = expiresIn - TOKEN_MARGIN_S;
+      if (ttl < 60) ttl = 60;
+      cloudTokenTtlMs = (unsigned long)ttl * 1000UL;
+      cloudTokenAt = millis();
+      cloudRetryDelay = 0;
+      Serial.println("Cloud: signed in.");
+      return true;
+    }
+  }
+
+  res.clear();
+  deserializeJson(res, resp);
+  Serial.printf("Cloud: sign-in failed (HTTP %d): %s\n", code, (const char *)(res["error"]["message"] | "-"));
+  cloudLastFail = millis();
+  cloudRetryDelay = (code == 400) ? SIGNIN_BAD_CRED_MS : SIGNIN_RETRY_MS;
+  return false;
+}
+
+// PATCH /latest.json. true jika berhasil.
+bool cloudPatchLatest(const char *payload) {
+  bool tokenOk = cloudToken.length() > 0 && (millis() - cloudTokenAt) < cloudTokenTtlMs;
+  if (!tokenOk && !cloudSignIn()) return false;
+
+  HTTPClient http;
+  http.setConnectTimeout(CLOUD_HTTP_TIMEOUT);
+  http.setTimeout(CLOUD_HTTP_TIMEOUT);
+
+  String url = cloudCfg.dbUrl + "/latest.json?print=silent&auth=" + cloudToken;
+  if (!http.begin(dbClient, url)) {
+    dbClient.stop();
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.PATCH((uint8_t *)payload, strlen(payload));
+  if (code == 200 || code == 204) {
+    http.end();
+    Serial.printf("Cloud: PATCH latest successed")
+    return true;
+  }
+
+  String err = (code > 0) ? http.getString() : String();
+  http.end();
+  Serial.printf("Cloud: PATCH latest failed (HTTP %d) %s\n", code, err.c_str());
+
+  if (code < 0) dbClient.stop();   // koneksi rusak -> dibuka ulang di request berikut
+  if (code == 401) {
+    // 401 bisa berarti token kedaluwarsa ATAU ditolak rules; jangan login tiap siklus
+    cloudToken = "";
+    cloudLastFail = millis();
+    cloudRetryDelay = SIGNIN_RETRY_MS;
+  }
+  return false;
+}
+
+void cloudTask(void *) {
+  dbClient.setInsecure();   // TIDAK memverifikasi sertifikat server (keputusan sementara)
+  bool reported = false;
+
+  for (;;) {
+    char *payload = nullptr;
+    if (xQueueReceive(cloudQueue, &payload, portMAX_DELAY) != pdTRUE || payload == nullptr) continue;
+
+    if (wifiFlag == WifiState::CONNECTED && cloudPatchLatest(payload) && !reported) {
+      reported = true;
+      Serial.printf("Cloud: first upload OK. Task stack free: %u bytes\n",
+                    (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    }
+    free(payload);
+  }
+}
+
+// =====================================================
+// AGREGATE ONE POLLING CYCLE
+// =====================================================
+
+// slaveID registered for this mac
+int findSlaveID(const uint8_t *mac) {
+  for (const auto &s : slaves) {
+    if (memcmp(s.mac, mac, 6) == 0) return s.slaveID;
+  }
+  return -1;
+}
+
+void startCycle(uint32_t reqTime) {
+  cycleReqTime = reqTime;
+  cycleExpected = slaves.size();
+  aggregate_rep.clear();
+  aggregate_rep["timestamp_req"] = reqTime;
+  aggregate_rep["slaves"].to<JsonObject>();
+}
+
+// called from onRecvReading() (context loop)
+void collectReading(int id, JsonObject obj) {
+  if (cycleState != CycleState::COLLECTING) {
+    Serial.println("Reading outside collect window. Ignored.");
+    return;
+  }
+  if ((uint32_t)(obj["reqTime"] | 0u) != cycleReqTime) {
+    Serial.println("Reading from an older cycle. Ignored.");
+    return;
+  }
+
+  String key = "slave" + String(id);
+  JsonObject dst = aggregate_rep["slaves"][key].to<JsonObject>();
+  for (JsonPair kv : obj) {
+    const char *k = kv.key().c_str();
+    if (strcmp(k, "reqTime") == 0 || strcmp(k, "slaveID") == 0) continue;   // already in the agregated report
+    dst[kv.key()] = kv.value();
+  }
+}
+
+// Transform aggregate_rep into PATCH body for /latest, then hand it over to the upload task
+void queueLatestUpload() {
+  JsonDocument patch;
+  JsonObject slavesObj = aggregate_rep["slaves"].as<JsonObject>();
+
+  for (JsonPair kv : slavesObj) {
+    String key = kv.key().c_str();
+    JsonObject s = kv.value().as<JsonObject>();
+
+    if (s["unreachable"] | false) {
+      // only touch the flag; last value and old updatedAt remain unchanged
+      patch[key + "/unreachable"] = true;
+    } else {
+      // change this slave node as a whole
+      patch[key] = s;
+      patch[key]["unreachable"] = false;
+      patch[key]["updatedAt"][".sv"] = "timestamp";   // server timestamp (ms epoch)
+    }
+  }
+
+  size_t n = measureJson(patch);
+  char *buf = (char *)malloc(n + 1);
+  if (buf == nullptr) {
+    Serial.println("Cloud: out of memory. Upload skipped.");
+    return;
+  }
+  serializeJson(patch, buf, n + 1);
+
+  // long queue 1: if the old content not yet taken, remove then overwrite it
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (xQueueSend(cloudQueue, &buf, 0) == pdTRUE) return;
+    char *old = nullptr;
+    if (xQueueReceive(cloudQueue, &old, 0) == pdTRUE) free(old);
+  }
+  free(buf);
+}
+
+void finalizeCycle() {
+  JsonObject slavesObj = aggregate_rep["slaves"].as<JsonObject>();
+
+  // registered slave that didnt reply -> flag it as unreachable
+  for (size_t i = 0; i < cycleExpected && i < slaves.size(); i++) {
+    String key = "slave" + String(slaves[i].slaveID);
+    if (!slavesObj[key].is<JsonObject>()) {
+      slavesObj[key]["unreachable"] = true;
+      Serial.printf("Slave #%d did not reply: unreachable.\n", slaves[i].slaveID);
+    }
+  }
+
+  cycleState = CycleState::IDLE;
+
+  if (cloudQueue == NULL) return;   // cloud inactive (incomplete config)
+  if (wifiFlag == WifiState::CONNECTED) {
+    queueLatestUpload();
+  } else {
+    Serial.println("Offline: aggregate not uploaded.");
+  }
+}
+
 /* =====================================================
    SETUP
    ===================================================== */
@@ -1097,6 +1392,13 @@ void setup() {
 
   lcd.init();
   lcd.backlight();
+
+  // false = dont automatically format if mount failed
+  if (LittleFS.begin(false)) {
+    loadCloudConfig();
+  } else {
+    Serial.println("LittleFS mount failed. Cloud config not loaded.");
+  }
 
   /*
     WiFi module initialization
@@ -1196,6 +1498,15 @@ void setup() {
   //   );
   // }
 
+  if (cloudCfg.valid) {
+    cloudQueue = xQueueCreate(1, sizeof(char *));
+    if (cloudQueue == NULL ||
+        xTaskCreate(cloudTask, "cloud", CLOUD_TASK_STACK, NULL, 1, NULL) != pdPASS) {
+      Serial.println("Failed to start cloud task. Upload disabled.");
+      cloudQueue = NULL;
+    }
+  }
+
   printSingleLog("Master ready", 2000);
 
   Serial.println("Setup complete.");
@@ -1219,11 +1530,7 @@ void loop() {
     lastStatus = millis();
 
     Serial.println("\n=== MASTER STATUS ===");
-    if (wifiFlag == WifiState::CONNECTED) {
-      if(!getLocalTime(&timeinfo)){
-        Serial.println("Failed to obtain time");
-        return;
-      }
+    if (wifiFlag == WifiState::CONNECTED && getLocalTime(&timeinfo, 0)) {
       Serial.println(&timeinfo, "Timestamp: %A, %B %d %Y %H:%M:%S");
     }
 
@@ -1238,27 +1545,23 @@ void loop() {
 
     Serial.printf("Active channel: %d\n", active_channel);
 
-    uint8_t pri; wifi_second_chan_t sec;
-    esp_wifi_get_channel(&pri, &sec);
-    Serial.printf("Radio channel (actual): %d\n", pri);
+    Serial.printf("Free heap: %u bytes\n", (unsigned)ESP.getFreeHeap());
   }
 
   /*
-     Polling each interval of POLL_INTERVAL secs
+     Start a new cycle only if the previous cycle has finished
   */
 
-  if (slaves.size() > 0 && millis() - lastPolling >= POLL_INTERVAL) {
+  if (cycleState == CycleState::IDLE && slaves.size() > 0 &&
+      millis() - lastPolling >= POLL_INTERVAL) {
     lastPolling = millis();
 
     Serial.println("\n=== POLLING SLAVES ===");
-    
-    if (wifiFlag == WifiState::CONNECTED) {
-      if(!getLocalTime(&timeinfo)){
-        Serial.println("Failed to obtain time");
-        return;
-      }
+    if (wifiFlag == WifiState::CONNECTED && getLocalTime(&timeinfo, 0)) {
       Serial.println(&timeinfo, "Timestamp: %A, %B %d %Y %H:%M:%S");
     }
+
+    startCycle((uint32_t)lastPolling);
 
     // Poll to each slave
     for (auto &slave : slaves) {
@@ -1281,6 +1584,20 @@ void loop() {
       Serial.printf("Request status: %s\n", esp_err_to_name(result));
 
       delay(100);
+    }
+
+    cycleSentAt = millis();
+    cycleState = CycleState::COLLECTING;
+  }
+
+  /*
+     Finish cycle if all slave replied or timeout reached
+  */
+  
+  if (cycleState == CycleState::COLLECTING) {
+    JsonObject so = aggregate_rep["slaves"].as<JsonObject>();
+    if (so.size() >= cycleExpected || millis() - cycleSentAt >= COLLECT_TIMEOUT) {
+      finalizeCycle();
     }
   }
 
