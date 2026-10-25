@@ -17,6 +17,7 @@
 /* =====================================================
    CONFIGURATION
    ===================================================== */
+
 #define apSSID "I-Surf Setup"
 #define apPassword "saya-berselancar"
 #define WIFI_INTERFACE WIFI_IF_STA
@@ -1244,7 +1245,7 @@ bool cloudPatchLatest(const char *payload) {
   int code = http.PATCH((uint8_t *)payload, strlen(payload));
   if (code == 200 || code == 204) {
     http.end();
-    Serial.printf("Cloud: PATCH latest successed")
+    Serial.printf("Cloud: PATCH latest succeeded");
     return true;
   }
 
