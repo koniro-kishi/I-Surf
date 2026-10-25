@@ -10,7 +10,9 @@
 #define DEFAULT_SLAVE_CHANNEL 1
 #define SLAVE_TYPE "Irrigation"
 #define DEBUG_INTERVAL 10000 // 10 secs
-#define REQ_INT 15000   // ms; 3x master POLL_INTERVAL (5000)
+#define DEBUG_INT 10000      // 10 secs
+#define SEARCH_INT 1000      // ms; dwell time per channel while searching master
+#define REQ_INT 15000        // ms; 3x master POLL_INTERVAL (5000)
 
 #define READING_PACKET_MAX  250   // batas payload ESP-NOW
 #define READING_HEADER_SIZE 24    // srcAddr(6)+msgType(1)+slaveID(1)+slaveType(16)
@@ -81,7 +83,9 @@ uint8_t slaveID = 0;
 volatile bool master_found = false;     // safely used in the background
 volatile bool received_confirm = false;
 uint8_t current_scan_channel;
-uint8_t active_channel;
+volatile uint8_t active_channel;
+unsigned long lastSearchStep = 0;
+bool searchStepPending = false;         // true -> next searchMasterStep() runs immediately
 
 bool master_peer_added = false;
 volatile unsigned long lastRequestTime = 0;
@@ -157,39 +161,40 @@ bool sendToMaster(const uint8_t *data, size_t length) {
   return result == ESP_OK;
 }
 
-void searchMaster() {
-  static const uint8_t broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
+// Prepare a new search. Does not block and does not send anything.
+void startSearch() {
   // drop stale master peer (master may have rebooted on another channel)
   if (esp_now_is_peer_exist(master_mac)) esp_now_del_peer(master_mac);
   memset(master_mac, 0, 6);
+
+  // start from the last known channel when re-searching
+  current_scan_channel = (active_channel != 0) ? active_channel : DEFAULT_SLAVE_CHANNEL;
+  searchStepPending = true;   // first broadcast runs on the next step
+}
+
+// One non-blocking step: broadcast on the current channel, wait SEARCH_INT, then hop.
+void searchMasterStep() {
+  static const uint8_t broadcastAddress[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+  if (master_found) return;
+
+  if (!searchStepPending) {
+    if (millis() - lastSearchStep < SEARCH_INT) return;
+    current_scan_channel = (current_scan_channel % 13) + 1;
+  }
+  searchStepPending = false;
+  lastSearchStep = millis();
 
   search_master searchMessage = {};
   WiFi.macAddress(searchMessage.srcAddr);
   searchMessage.msgType = MSG_SEARCH_MASTER;
   strncpy(searchMessage.slaveType, SLAVE_TYPE, sizeof(searchMessage.slaveType) - 1);
 
-  // start from the last known channel when re-searching
-  current_scan_channel = (active_channel != 0) ? active_channel : DEFAULT_SLAVE_CHANNEL;
+  WiFi.setChannel(current_scan_channel);
+  Serial.printf("Broadcasting search on channel %d...\n", current_scan_channel);
 
-  while (!master_found) {
-    WiFi.setChannel(current_scan_channel);
-    Serial.printf("Broadcasting search on channel %d...\n", current_scan_channel);
-
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&searchMessage, sizeof(searchMessage));
-    Serial.printf("Broadcast status: %s\n", esp_err_to_name(result));
-
-    for (int i = 0; i < 10 && !master_found; i++) delay(100);
-    if (master_found) break;
-
-    current_scan_channel = (current_scan_channel % 13) + 1;
-  }
-
-  // radio mungkin berhenti di channel tetangga (overlap); pindah ke channel master
-  esp_wifi_set_channel(active_channel, WIFI_SECOND_CHAN_NONE);
-  current_scan_channel = active_channel;
-
-  lastRequestTime = millis();
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&searchMessage, sizeof(searchMessage));
+  Serial.printf("Broadcast status: %s\n", esp_err_to_name(result));
 }
 
 
@@ -226,9 +231,9 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
     return;
   }
 
+  lastRequestTime = millis();   // grace period after (re)registration
   master_found = true;
   received_confirm = true;
-  lastRequestTime = millis();   // grace period after (re)registration
 
   Serial.printf("Slave ID: %d\n", slaveID);
 
@@ -431,11 +436,10 @@ void setup() {
     );
   }
 
-  // search for master by broadcasting while channel hopping
-  searchMaster();
+   // search for master runs non-blocking from loop()
+  startSearch();
 
-  Serial.println("\nConnected to Master!");
-  Serial.println("Starting normal operation...");
+  Serial.println("\nSetup complete. Searching for Master from loop()...");
 }
 
 /* =====================================================
@@ -443,18 +447,31 @@ void setup() {
    ===================================================== */
 
 void loop() {
-  // condition: master was registered but after some time doesnt get request
-  // potential cause: master or router reboot and changes it channel
-  if (master_found && millis() - lastRequestTime >= REQ_INT) {
-    Serial.println("No master request within REQ_INT. Searching master again...");
-    master_found = false;
-    searchMaster();
+    // master confirmed (set by callback in WiFi task): pull radio to master's channel.
+  // The radio may have stopped on an overlapping neighbour channel while searching.
+  if (received_confirm) {
+    received_confirm = false;
+    esp_wifi_set_channel(active_channel, WIFI_SECOND_CHAN_NONE);
+    current_scan_channel = active_channel;
+    lastRequestTime = millis();
+    Serial.printf("Radio synced to master channel %d\n", active_channel);
+  }
+
+  if (master_found) {
+    // master was registered but no request arrives: master/router may have rebooted
+    if (millis() - lastRequestTime >= REQ_INT) {
+      Serial.println("No master request within REQ_INT. Searching master again...");
+      master_found = false;
+      startSearch();
+    }
+  } else {
+    searchMasterStep();
   }
 
   static unsigned long lastDebug = 0;
 
   // print debug each interval of DEBUG_INTERVAL sec
-  if (millis() - lastDebug >= DEBUG_INTERVAL) {
+  if (millis() - lastDebug >= DEBUG_INT) {
     lastDebug = millis();
 
     Serial.println("\n=== SLAVE STATUS ===");
