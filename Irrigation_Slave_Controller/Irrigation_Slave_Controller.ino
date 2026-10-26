@@ -17,6 +17,11 @@
 #define NEW_INT 2000         // ms; interval of reading all sensors (newSlaveState)
 #define SENSOR_DEBUG         // comment out to silence the raw sensor line
 
+// Temperature value from misting slave
+#define TDS_TEMP_DEFAULT 25.0f   // C; used when master has no misting temperature
+#define TDS_TEMP_MIN 0.0f
+#define TDS_TEMP_MAX 60.0f
+
 // pins
 #define pin_WaterSV 26
 #define pin_FertSV 27
@@ -71,8 +76,11 @@ typedef struct __attribute__((packed)) {
   uint8_t dstAddr[6];
   uint8_t slaveID;
   char slaveType[16];
-  uint32_t reqTime;          // master millis() saat polling
+  uint32_t reqTime;          // master millis() when polling
+  float   airTemp;           // misting air temperature relayed by master (C)
+  uint8_t airTempValid;      // 1 = airTemp usable
 } master_request;
+static_assert(sizeof(master_request) == 39, "master_request size mismatch");
 
 // 3. Slave reading report
 typedef struct __attribute__((packed)) {
@@ -124,8 +132,8 @@ const float soilPH_V7    = 2.50f; // PLACEHOLDER, sensor output unknown
 const float soilPH_Slope = 0.18f; // PLACEHOLDER
 const float tdsK         = 1.0f;  // TDS correction factor (standard solution / reading)
 
-float tdsTempC = 25.0f;           // water temperature for TDS compensation (overwrited in the future)
-const uint16_t tdsGapMs = 40;     // delay between TDS samples
+volatile float tdsTempC = TDS_TEMP_DEFAULT;  // water temperature for TDS compensation (overwrited in the future)
+const uint16_t tdsGapMs = 40;                 // delay between TDS samples
 const unsigned long echoTimeoutUs = 30000;
 
 // Sensor data
@@ -237,8 +245,8 @@ SlaveState newSlaveState() {
   s.fertTDS = round2(readTDS(tds_mV));
 
 #ifdef SENSOR_DEBUG
-  Serial.printf("RAW | fertPH:%dmV soilPH:%dmV waterDist:%.1fcm fertDist:%.1fcm soilRaw:%d tds:%dmV\n",
-                fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, tds_mV);
+   Serial.printf("RAW | fertPH:%dmV soilPH:%dmV waterDist:%.1fcm fertDist:%.1fcm soilRaw:%d tds:%dmV @%.1fC\n",
+                fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, tds_mV, (float)tdsTempC);
   Serial.printf("STATE | wLvl:%.2f fLvl:%.2f moist:%.2f soilPH:%.2f fertPH:%.2f TDS:%.2f pump:%d wSV:%d fSV:%d\n",
                 s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTDS,
                 s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
@@ -335,6 +343,8 @@ void startSearch() {
   // drop stale master peer (master may have rebooted on another channel)
   if (esp_now_is_peer_exist(master_mac)) esp_now_del_peer(master_mac);
   memset(master_mac, 0, 6);
+  
+  tdsTempC = TDS_TEMP_DEFAULT;   // no master -> no misting temperature
 
   // start from the last known channel when re-searching
   current_scan_channel = (active_channel != 0) ? active_channel : DEFAULT_SLAVE_CHANNEL;
@@ -427,6 +437,12 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
 
   memcpy(&request, incomingData, sizeof(request));
   uint32_t reqTime = request.reqTime;
+
+  // air temperature of the misting slave (relayed by master) for TDS compensation
+  bool tempOk = request.airTempValid &&
+                request.airTemp >= TDS_TEMP_MIN && request.airTemp <= TDS_TEMP_MAX;
+  tdsTempC = tempOk ? request.airTemp : TDS_TEMP_DEFAULT;
+  Serial.printf("TDS temperature: %.1f C (%s)\n", (float)tdsTempC, tempOk ? "from misting" : "default");
 
   Serial.println("\n=== MASTER REQUEST RECEIVED ===");
   Serial.printf("Request for Slave ID: %d\n", request.slaveID);

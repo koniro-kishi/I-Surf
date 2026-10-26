@@ -18,32 +18,42 @@
    CONFIGURATION
    ===================================================== */
 
+// softAP Credential
 #define apSSID "I-Surf Setup"
 #define apPassword "saya-berselancar"
 #define WIFI_INTERFACE WIFI_IF_STA
+#define TRY_CONNECT_WINDOW 15000    // 15 sec; master trying to connect to a network
+#define SOFTAP_WINDOW      300000   // 5 min; master running softAP
+#define OFFLINE_CHANNEL    1        // identical to DEFAULT_SLAVE_CHANNEL in slave code
 
-#define STAT_INTERVAL 10000 // 10 sec; master prints its state
-#define POLL_INTERVAL 5000  // 5 sec; master sent polling request to slaves
-
+// previously connected credential
 #define NVS_SLAVE_NAMESPACE "saved_slave"
 #define NVS_CRED_NAMESPACE "saved_cred"
 
-#define TRY_CONNECT_WINDOW 15000    // 15 sec; master trying to connect to a network
-#define SOFTAP_WINDOW      300000   // 5 min; master running softAP
-#define OFFLINE_CHANNEL    1        // sama dengan DEFAULT_SLAVE_CHANNEL di slave
+// intervals of action
+#define STAT_INTERVAL 10000         // 10 sec; master prints its state
+#define POLL_INTERVAL 5000          // 5 sec; master sent polling request to slaves
+#define WIFI_RET_INTERVAL    120000 // 2 min between wifi retry attempt (state FAILED)
 
-#define WIFI_RET_INTERVAL    120000  // 2 menit antar percobaan retry (state FAILED)
+// fallback when state FAILED
 #define WIFI_RET_TRY_WINDOW   10000  // 10 detik per percobaan retry
 #define WIFI_RET_LIMIT           10  // percobaan gagal berturut-turut (termasuk saat boot)
 #define SOFTAP_RET_WINDOW    300000  // 5 menit ON, 5 menit OFF (state NO_REGISTERED)
 
+// Firebase connection
 #define ENV_PATH            "/.env"
-#define COLLECT_TIMEOUT     2000     // ms; batas tunggu balasan sejak request terakhir dikirim
-#define CLOUD_HTTP_TIMEOUT  5000     // ms
-#define CLOUD_TASK_STACK    12288    // byte; cek dengan log stack di bawah
-#define SIGNIN_RETRY_MS     30000    // jeda setelah gagal jaringan / ditolak (401)
-#define SIGNIN_BAD_CRED_MS  300000   // jeda setelah HTTP 400 (kredensial atau konfigurasi salah)
-#define TOKEN_MARGIN_S      300      // login ulang 5 menit sebelum token kedaluwarsa
+#define COLLECT_TIMEOUT     2000    // ms; time limit of waiting reply from latest request sent
+#define CLOUD_HTTP_TIMEOUT  5000    // ms
+#define CLOUD_TASK_STACK    12288   // byte; check with log stack bellow
+#define SIGNIN_RETRY_MS     30000   // delay after HTTP 401 (failed or denied connection)
+#define SIGNIN_BAD_CRED_MS  300000  // delay after HTTP 400 (wrong credential or configuration)
+#define TOKEN_MARGIN_S      300     // login again after 5 min before token expires
+
+// Communication between slave
+#define MIST_TEMP_MAX_AGE   3            // cycles; relayed misting temperature stays valid this long
+#define DUMMY_MISTING                    // comment out when the real misting slave exists
+#define DUMMY_MIST_TEMP     28.0f        // dummy misting air temperature (C)
+#define MIN_VALID_EPOCH     1700000000UL // clock counts as set by NTP after Nov 2023
 
 /* =====================================================
    MESSAGE TYPES AND SIZE
@@ -84,8 +94,11 @@ typedef struct __attribute__((packed)) {
   uint8_t dstAddr[6];
   uint8_t slaveID;
   char slaveType[16];
-  uint32_t reqTime;          // master millis() saat polling
+  uint32_t reqTime;          // master millis() when polling, used as polling ID
+  float   airTemp;           // misting air temperature relayed by master (C)
+  uint8_t airTempValid;      // 1 = airTemp usable, 0 = slave must use its default
 } master_request;
+static_assert(sizeof(master_request) == 39, "master_request size mismatch");
 
 // 3. Slave reading report
 typedef struct __attribute__((packed)) {
@@ -188,9 +201,7 @@ WifiState lastHandledFlag = WifiState::IDLE;
 // time synchronization
 
 const char* ntpServer = "pool.ntp.org";
-const long  gmtOffset_sec = 0;
-const int   daylightOffset_sec = 3600;
-struct tm timeinfo;
+const char* tzInfo = "WIB-7";     // POSIX TZ:
 
 
 // read queue
@@ -204,6 +215,12 @@ CycleState cycleState = CycleState::IDLE;
 uint32_t cycleReqTime = 0;
 unsigned long cycleSentAt = 0;
 size_t cycleExpected = 0;      // number of slave when the cycle start
+uint32_t cycleCounter = 0;      // incremented every startCycle()
+time_t cycleReqEpoch = 0;       // wall-clock of cycleReqTime; 0 = clock not valid yet
+
+// misting air temperature relayed to slaves (dummy until the misting slave exists)
+float mistTemp = 0;
+uint32_t mistTempCycle = 0;     // cycleCounter when mistTemp was captured; 0 = never
 
 // Queue for task upload: item = char* in heap
 QueueHandle_t cloudQueue = NULL;
@@ -314,6 +331,28 @@ void printMac(const uint8_t *mac) {
     mac[0], mac[1], mac[2],
     mac[3], mac[4], mac[5]
   );
+}
+
+bool isTimeValid() {
+  return time(nullptr) >= (time_t)MIN_VALID_EPOCH;
+}
+
+// Format an epoch as "Monday, October 26 2026 09:32:27" in local time (WIB). false if the clock is not valid.
+bool formatTimestamp(time_t t, char *buf, size_t len) {
+  if (t < (time_t)MIN_VALID_EPOCH) return false;
+  struct tm tmv;
+  localtime_r(&t, &tmv);
+  strftime(buf, len, "%A, %B %d %Y %H:%M:%S", &tmv);
+  return true;
+}
+
+// Print "Timestamp: ..." for now. Prints nothing until the clock was set by NTP
+// (works offline too, once the clock has been set).
+void printTimestamp() {
+  char buf[48];
+  if (formatTimestamp(time(nullptr), buf, sizeof(buf))) {
+    Serial.printf("Timestamp: %s\n", buf);
+  }
 }
 
 // Print one line of string in both serial and LCD
@@ -610,7 +649,7 @@ void startSoftAP() {
 void onWiFiEvent(arduino_event_id_t event, arduino_event_info_t info) {
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP && wifiFlag == WifiState::TRYING) {
     wifiFlag = WifiState::CONNECTED;
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    configTzTime(tzInfo, ntpServer);
   }
   else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     uint8_t reason = info.wifi_sta_disconnected.reason;
@@ -1042,6 +1081,16 @@ void onDiscSlave(const esp_now_recv_info_t *info, const uint8_t *incomingData, i
    SENSOR READING HANDLER
    ===================================================== */
 
+// " (timestamp)" if this reqTime belongs to the current cycle and the clock is valid, else " (n/a)"
+void printReqTimeStamp(uint32_t reqTime) {
+  char buf[48];
+  if (reqTime == cycleReqTime && formatTimestamp(cycleReqEpoch, buf, sizeof(buf))) {
+    Serial.printf(" (%s)", buf);
+  } else {
+    Serial.print(" (n/a)");
+  }
+}
+
 void onRecvReading(RxReading &rItem) {
   int regID = findSlaveID(rItem.srcAddr);
   if (regID < 0) {
@@ -1071,6 +1120,9 @@ void onRecvReading(RxReading &rItem) {
     Serial.print(kv.key().c_str());
     Serial.print(": ");
     serializeJson(kv.value(), Serial);
+    if (strcmp(kv.key().c_str(), "reqTime") == 0) {
+      printReqTimeStamp(kv.value().as<uint32_t>());
+    }
     Serial.println();
   }
 
@@ -1245,7 +1297,7 @@ bool cloudPatchLatest(const char *payload) {
   int code = http.PATCH((uint8_t *)payload, strlen(payload));
   if (code == 200 || code == 204) {
     http.end();
-    Serial.printf("Cloud: PATCH latest succeeded");
+    Serial.println("Cloud: PATCH latest succeeded");
     return true;
   }
 
@@ -1294,6 +1346,8 @@ int findSlaveID(const uint8_t *mac) {
 
 void startCycle(uint32_t reqTime) {
   cycleReqTime = reqTime;
+  cycleReqEpoch = isTimeValid() ? time(nullptr) : 0;
+  cycleCounter++;
   cycleExpected = slaves.size();
   aggregate_rep.clear();
   aggregate_rep["timestamp_req"] = reqTime;
@@ -1357,6 +1411,16 @@ void queueLatestUpload() {
   free(buf);
 }
 
+// Capture the misting temperature at the end of a cycle; it is relayed in the NEXT cycle's requests.
+void updateMistTemp() {
+  #ifdef DUMMY_MISTING
+    mistTemp = DUMMY_MIST_TEMP;
+    mistTempCycle = cycleCounter;
+  #else
+    // real misting slave: read its temperature key from aggregate_rep["slaves"]
+  #endif
+}
+
 void finalizeCycle() {
   JsonObject slavesObj = aggregate_rep["slaves"].as<JsonObject>();
 
@@ -1370,6 +1434,7 @@ void finalizeCycle() {
   }
 
   cycleState = CycleState::IDLE;
+  updateMistTemp();
 
   if (cloudQueue == NULL) return;   // cloud inactive (incomplete config)
   if (wifiFlag == WifiState::CONNECTED) {
@@ -1531,9 +1596,8 @@ void loop() {
     lastStatus = millis();
 
     Serial.println("\n=== MASTER STATUS ===");
-    if (wifiFlag == WifiState::CONNECTED && getLocalTime(&timeinfo, 0)) {
-      Serial.println(&timeinfo, "Timestamp: %A, %B %d %Y %H:%M:%S");
-    }
+    
+    printTimestamp();
 
     Serial.printf("Registered slaves: %d\n", slaves.size());
 
@@ -1558,11 +1622,12 @@ void loop() {
     lastPolling = millis();
 
     Serial.println("\n=== POLLING SLAVES ===");
-    if (wifiFlag == WifiState::CONNECTED && getLocalTime(&timeinfo, 0)) {
-      Serial.println(&timeinfo, "Timestamp: %A, %B %d %Y %H:%M:%S");
-    }
+    printTimestamp();
 
     startCycle((uint32_t)lastPolling);
+
+    // misting temperature captured at the previous cycle, valid for MIST_TEMP_MAX_AGE cycles
+    bool mistValid = (mistTempCycle != 0) && (cycleCounter - mistTempCycle <= MIST_TEMP_MAX_AGE);
 
     // Poll to each slave
     for (auto &slave : slaves) {
@@ -1573,7 +1638,9 @@ void loop() {
       memcpy(requestMessage.dstAddr, slave.mac, 6);
       requestMessage.slaveID = slave.slaveID;
       strncpy(requestMessage.slaveType, slave.slaveType.c_str(), sizeof(requestMessage.slaveType) - 1);
-      requestMessage.reqTime = (uint32_t)lastPolling;   // satu timestamp per siklus polling
+      requestMessage.reqTime = (uint32_t)lastPolling;   // one timestamp for each polling cycle
+      requestMessage.airTemp = mistValid ? mistTemp : 0.0f;
+      requestMessage.airTempValid = mistValid ? 1 : 0;
 
       Serial.printf("Requesting Slave #%d (", slave.slaveID);
       printMac(slave.mac);
