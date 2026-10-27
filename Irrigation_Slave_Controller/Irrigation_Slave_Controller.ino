@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <esp_timer.h>
 #include <time.h>
+#include <stdarg.h>
 
 /* === DEFINITIONS === */
 
@@ -22,7 +23,8 @@
 #define SEARCH_INT 1000      // ms; dwell time per channel while searching master
 #define REQ_INT 15000        // ms; 3x master POLL_INTERVAL (5000)
 #define NEW_INT 2000         // ms; interval of reading all sensors (newSlaveState)
-#define SENSOR_DEBUG         // comment out to silence the raw sensor line
+// #define SENSOR_DEBUG   // enable raw/state sensor lines on each NEW_INT (for calibration)
+// #define LOG_DEBUG      // enable raw ESP-NOW packets, JSON payloads, and each search channel
 
 // Temperature value from misting slave
 #define TDS_TEMP_DEFAULT 25.0f   // C; used when master has no misting temperature
@@ -69,6 +71,16 @@ static_assert(sizeof(NVS_SCHEDULE_NAMESPACE) - 1 <= 15, "NVS namespace max 15 ch
 #define MSG_MASTER_CONFIRM  1
 #define MSG_MASTER_REQUEST  2
 #define MSG_SLAVE_READING   3
+
+// Logger: one line "<time> [TAG   ] message". Prototypes allow use anywhere in the sketch.
+void slog(const char *tag, const char *fmt, ...)  __attribute__((format(printf, 2, 3)));
+void slogw(const char *tag, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+#ifdef LOG_DEBUG
+  #define slogd(tag, ...) slog(tag, __VA_ARGS__)
+#else
+  #define slogd(tag, ...) ((void)0)
+#endif
 
 /* === STRUCTS === */
 
@@ -137,8 +149,7 @@ struct DefaultSchedule {
 };
 
 const DefaultSchedule defaultSchedules[] = {
-  // {"08:00", 120}, {"12:00", 120}, {"16:00", 120}
-  {"13:09", 20}, {"13:11", 20}
+  {"08:00", 120}, {"12:00", 120}, {"16:00", 120}
 };
 
 std::vector<schedule> schedules;   // sorted ascending on start
@@ -282,11 +293,11 @@ SlaveState newSlaveState() {
   s.fertTDS = round2(readTDS(tds_mV));
 
 #ifdef SENSOR_DEBUG
-   Serial.printf("RAW | fertPH:%dmV soilPH:%dmV waterDist:%.1fcm fertDist:%.1fcm soilRaw:%d tds:%dmV @%.1fC\n",
-                fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, tds_mV, (float)tdsTempC);
-  Serial.printf("STATE | wLvl:%.2f fLvl:%.2f moist:%.2f soilPH:%.2f fertPH:%.2f TDS:%.2f pump:%d wSV:%d fSV:%d\n",
-                s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTDS,
-                s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
+    slog("SENSOR", "raw fertPH %dmV soilPH %dmV water %.1fcm fert %.1fcm soil %d tds %dmV @%.1fC",
+      fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, tds_mV, (float)tdsTempC);
+    slog("SENSOR", "state wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f TDS %.2f pump %d wSV %d fSV %d",
+      s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTDS,
+      s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
 #endif
 
   return s;
@@ -319,59 +330,36 @@ void initSensorsAndRelays() {
 
 /* === UTILITY FUNCTIONS === */
 
-// Print mac address as a string
-void printMac(const uint8_t *mac) {
-  Serial.printf(
-    "%02X:%02X:%02X:%02X:%02X:%02X",
-    mac[0], mac[1], mac[2],
-    mac[3], mac[4], mac[5]
-  );
+void macToStr(const uint8_t *mac, char *buf) {
+  snprintf(buf, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 // Add master as a peer and storing its information
 bool addMasterPeer(const uint8_t *mac) {
-  // Check if peer is registered in ESP-NOW's peer table
-  if (esp_now_is_peer_exist(mac)) {
-    Serial.println("Master peer already exists");
-    return true;
-  }
-
-  // Creating a peer instance for master
+  if (esp_now_is_peer_exist(mac)) return true;
   esp_now_peer_info_t peerInfo = {};
-  
   memcpy(peerInfo.peer_addr, mac, 6);
-  peerInfo.channel = 0; // current active channel
+  peerInfo.channel = 0;
   peerInfo.ifidx = WIFI_IF_STA;
   peerInfo.encrypt = false;
 
-  // Adding the peer
   esp_err_t result = esp_now_add_peer(&peerInfo);
-
   if (result != ESP_OK) {
-    Serial.printf(
-      "Failed to add Master peer: %s\n",
-      esp_err_to_name(result)
-    );
+    slogw("MASTER", "failed to add peer: %s", esp_err_to_name(result));
     return false;
   }
-
-  Serial.println("Master peer added successfully");
   return true;
 }
 
 // Send unicast message to master
 bool sendToMaster(const uint8_t *data, size_t length) {
-  // check if this slave already registered a master
   if (!master_found) {
-    Serial.println("Cannot send: Master not found");
+    slogw("MASTER", "cannot send: master not found");
     return false;
   }
-
-  // try to send the message
   esp_err_t result = esp_now_send(master_mac, data, length);
-
-  Serial.printf("Send to Master: %s\n", esp_err_to_name(result));
-
+  if (result != ESP_OK) slogw("MASTER", "send failed: %s", esp_err_to_name(result));
   return result == ESP_OK;
 }
 
@@ -385,6 +373,7 @@ void startSearch() {
 
   // start from the last known channel when re-searching
   current_scan_channel = (active_channel != 0) ? active_channel : DEFAULT_SLAVE_CHANNEL;
+  slog("SEARCH", "looking for master, starting at ch %d", current_scan_channel);
   searchStepPending = true;   // first broadcast runs on the next step
 }
 
@@ -397,6 +386,7 @@ void searchMasterStep() {
   if (!searchStepPending) {
     if (millis() - lastSearchStep < SEARCH_INT) return;
     current_scan_channel = (current_scan_channel % 13) + 1;
+    if (current_scan_channel == 1) slog("SEARCH", "wrapped to ch 1, still searching");
   }
   searchStepPending = false;
   lastSearchStep = millis();
@@ -407,10 +397,11 @@ void searchMasterStep() {
   strncpy(searchMessage.slaveType, SLAVE_TYPE, sizeof(searchMessage.slaveType) - 1);
 
   WiFi.setChannel(current_scan_channel);
-  Serial.printf("Broadcasting search on channel %d...\n", current_scan_channel);
+  slogd("SEARCH", "broadcast on ch %d", current_scan_channel);
+  if (current_scan_channel == 1) slog("SEARCH", "sweep complete, still searching");
 
   esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&searchMessage, sizeof(searchMessage));
-  Serial.printf("Broadcast status: %s\n", esp_err_to_name(result));
+  if (result != ESP_OK) slogw("SEARCH", "broadcast failed: %s", esp_err_to_name(result));
 }
 
 
@@ -443,8 +434,8 @@ void syncTime(uint32_t epoch, int64_t rxMs) {
   portEXIT_CRITICAL(&timeMux);
 
   if (applied) {
-    if (first) Serial.println("Time: first sync from master.");
-    else Serial.printf("Time: resync step %lld ms\n", (long long)diff);
+    if (first) slog("TIME", "first sync from master");
+    else slog("TIME", "resync step %lld ms", (long long)diff);
   }
 }
 
@@ -464,12 +455,48 @@ int32_t getLocalSecondOfDay() {
   return t < 0 ? -1 : (int32_t)(t % (int64_t)SECONDS_PER_DAY);
 }
 
-// Nomor hari lokal WIB, -1 if not synced
+// Local day number WIB, -1 if not synced
 int32_t getLocalDayNumber() {
   int64_t t = getLocalEpoch();
   return t < 0 ? -1 : (int32_t)(t / (int64_t)SECONDS_PER_DAY);
 }
 
+
+
+/* === LOGGING === */
+
+void logPrefix(char *buf, size_t len) {
+  int64_t t = getLocalEpoch();
+  if (t >= 0) {
+    uint32_t s = (uint32_t)(t % (int64_t)SECONDS_PER_DAY);
+    snprintf(buf, len, "%02lu:%02lu:%02lu",
+             (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60), (unsigned long)(s % 60));
+  } else {
+    snprintf(buf, len, "+%.1fs", (double)uptimeMs() / 1000.0);
+  }
+}
+
+static void vlog(const char *tag, const char *mark, const char *fmt, va_list ap) {
+  char pre[16];
+  char msg[200];
+  logPrefix(pre, sizeof(pre));
+  vsnprintf(msg, sizeof(msg), fmt, ap);
+  Serial.printf("%s [%-6s] %s%s\n", pre, tag, mark, msg);
+}
+
+void slog(const char *tag, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vlog(tag, "", fmt, ap);
+  va_end(ap);
+}
+
+void slogw(const char *tag, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vlog(tag, "WARN: ", fmt, ap);
+  va_end(ap);
+}
 
 
 /* === SCHEDULE === */
@@ -513,7 +540,7 @@ size_t readScheduleEntries(std::vector<schedule> &out) {
 
   Preferences prefs;
   if (!prefs.begin(NVS_SCHEDULE_NAMESPACE, false)) {
-    Serial.println("Schedule: failed to open NVS namespace.");
+    slogw("SCHED", "failed to open NVS namespace");
     return 0;
   }
 
@@ -530,14 +557,14 @@ size_t readScheduleEntries(std::vector<schedule> &out) {
     uint32_t stopSec  = prefs.getUInt(info.key, 0);
 
     if (!parseScheduleKey(info.key, startSec)) {
-      Serial.printf("Schedule: skip key=%s (invalid key)\n", info.key);
+      slogw("SCHED", "skip key '%s': invalid key", info.key);
     } else if (stopSec <= startSec || stopSec > SECONDS_PER_DAY) {
-      Serial.printf("Schedule: skip key=%s (invalid stop=%lu)\n", info.key, (unsigned long)stopSec);
+      slogw("SCHED", "skip key '%s': invalid stop %lu", info.key, (unsigned long)stopSec);
     } else {
       out.push_back({startSec, stopSec});
     }
 
-    err = nvs_entry_next(&it);   // it = NULL if there is more entry
+    err = nvs_entry_next(&it);   // it = NULL if there is no more entry
   }
 
   if (it) nvs_release_iterator(it);
@@ -545,7 +572,7 @@ size_t readScheduleEntries(std::vector<schedule> &out) {
   return entries;
 }
 
-// ascending based on start, remove duplicates, store to 'schedules'
+// ascending based on start, remove overlapping schedules, store to 'schedules'
 void buildSchedules(std::vector<schedule> &raw) {
   std::sort(raw.begin(), raw.end(),
             [](const schedule &a, const schedule &b) { return a.start < b.start; });
@@ -555,7 +582,7 @@ void buildSchedules(std::vector<schedule> &raw) {
     if (!schedules.empty() && s.start < schedules.back().stop) {
       char a[9];
       formatSecondOfDay(s.start, a, sizeof(a));
-      Serial.printf("Schedule: skip %s (overlaps previous schedule)\n", a);
+      slogw("SCHED", "skip %s: overlaps previous schedule", a);
       continue;
     }
     schedules.push_back(s);
@@ -563,13 +590,13 @@ void buildSchedules(std::vector<schedule> &raw) {
 }
 
 void printSchedules() {
-  Serial.printf("Schedules loaded: %u\n", (unsigned)schedules.size());
+  slog("SCHED", "%u schedule(s) loaded", (unsigned)schedules.size());
   for (size_t i = 0; i < schedules.size(); i++) {
     char a[9], b[9];
     formatSecondOfDay(schedules[i].start, a, sizeof(a));
     formatSecondOfDay(schedules[i].stop, b, sizeof(b));
-    Serial.printf("  #%u %s -> %s (%lu s)\n", (unsigned)i, a, b,
-                  (unsigned long)(schedules[i].stop - schedules[i].start));
+        slog("SCHED", "#%u %s-%s (%lu s)", (unsigned)i, a, b,
+          (unsigned long)(schedules[i].stop - schedules[i].start));
   }
 }
 
@@ -579,8 +606,8 @@ void initSchedules() {
   size_t entries = readScheduleEntries(raw);
 
   if (entries == 0) {
-    Serial.println("Schedule: NVS empty. Writing default schedules.");
-    if (!seedDefaultSchedules()) Serial.println("Schedule: failed to write defaults.");
+    slog("SCHED", "NVS empty, writing defaults");
+    if (!seedDefaultSchedules()) slogw("SCHED", "failed to write defaults");
     readScheduleEntries(raw);
   }
 
@@ -597,7 +624,7 @@ schedule nextSchedule_time = {0, 0};    // copy of schedules[nextSchedule_i]
 schedule curSchedule_time  = {0, 0};    // current or most recently executed schedule
 bool     nextIsTomorrow = false;        // true: nextSchedule_time = first schedule tomorrow
 bool     curScheduleDone = true;        // true: curSchedule_time already executed (or there isnt one)
-bool     isExecutingSchedule = false;   // true: pump is being activated (according to scheduke)
+bool     isExecutingSchedule = false;   // true: pump is being activated (according to schedule)
 unsigned long pumpStartMs = 0;
 unsigned long pumpRunMs   = 0;
 int32_t  lastDayNumber = -1;            // -1: not yet initialized schedule (waiting for valid time)
@@ -623,18 +650,21 @@ void startPump(unsigned long runMs) {
   pumpRunMs = runMs;
   isExecutingSchedule = true;
   curScheduleDone = true;     // this schedule is already executed dont execute it again
-  Serial.printf("Pump ON for %lu s\n", runMs / 1000UL);
+  char a[9], b[9];
+  formatSecondOfDay(curSchedule_time.start, a, sizeof(a));
+  formatSecondOfDay(curSchedule_time.stop, b, sizeof(b));
+  slog("PUMP", "ON for %lu s (schedule %s-%s)", runMs / 1000UL, a, b);
 }
 
-void stopPump() {
+void stopPump(const char *reason) {
   digitalWrite(pin_Pump, LOW);
   isExecutingSchedule = false;
-  Serial.println("Pump OFF");
+  slog("PUMP", "OFF (%s)", reason);
 }
 
 // Called first time of valid time and each day change
 void resyncSchedules(uint32_t nowSec) {
-  if (isExecutingSchedule) stopPump();   // make sure the previous day's schedule has stopped
+  if (isExecutingSchedule) stopPump("new day");   // make sure the previous day's schedule has stopped
 
   nextSchedule_i = 0;
   nextIsTomorrow = false;
@@ -655,12 +685,12 @@ void resyncSchedules(uint32_t nowSec) {
 // Called in each loop() iteration
 void maintainSchedule() {
   // Stop is based on millis(): keep running even if clock shift or not synced
-  if (isExecutingSchedule && millis() - pumpStartMs >= pumpRunMs) stopPump();
+  if (isExecutingSchedule && millis() - pumpStartMs >= pumpRunMs) stopPump("duration reached");
 
   if (schedules.empty()) return;
 
   int64_t t = getLocalEpoch();
-  if (t < 0) return;                      // not synced: pompa will not be activated
+  if (t < 0) return;                      // not synced: pump will not be activated
   int32_t  day    = (int32_t)(t / (int64_t)SECONDS_PER_DAY);
   uint32_t nowSec = (uint32_t)(t % (int64_t)SECONDS_PER_DAY);
 
@@ -672,7 +702,7 @@ void maintainSchedule() {
 
   // 1. next schedule start time has been passed
   if (!nextIsTomorrow && nowSec >= nextSchedule_time.start) {
-    if (isExecutingSchedule) stopPump();
+    if (isExecutingSchedule) stopPump("next schedule reached");
     curSchedule_time = nextSchedule_time;
     curScheduleDone = false;
     getNextSchedule(nowSec);
@@ -685,6 +715,35 @@ void maintainSchedule() {
   }
 }
 
+void printStatus() {
+  char mac[18] = "none";
+  if (master_found) macToStr(master_mac, mac);
+
+  char nxt[24] = "-";
+  if (lastDayNumber >= 0) {
+    uint32_t s = nextSchedule_time.start;
+    snprintf(nxt, sizeof(nxt), "%02lu:%02lu%s", (unsigned long)(s / 3600),
+             (unsigned long)((s / 60) % 60), nextIsTomorrow ? " (tomorrow)" : "");
+  }
+
+  uint8_t pri;
+  wifi_second_chan_t sec;
+  esp_wifi_get_channel(&pri, &sec);
+
+  slog("STATUS", "master %s | id %d | ch %d | next %s | pump %s",
+       mac, slaveID, pri, nxt, isExecutingSchedule ? "ON" : "OFF");
+
+  SlaveState s;
+  portENTER_CRITICAL(&stateMux);
+  s = slaveState;
+  portEXIT_CRITICAL(&stateMux);
+
+  slog("SENSOR", "wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f TDS %.1f | relays %d/%d/%d",
+       s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTDS,
+       s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
+}
+
+
 
 /* =====================================================
    MESSAGE HANDLERS
@@ -692,21 +751,13 @@ void maintainSchedule() {
 
 // When master send a confirmation message that this slave is registered by it
 void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *senderMac) {
-  // Check if the message type is incorrectly assigned to the data
-  // So it is actually not a search_master data
   if (len != sizeof(master_confirm)) {
-    Serial.println("Invalid master_confirm size");
+    slogw("MASTER", "invalid master_confirm size: %d (expected %u)", len, (unsigned)sizeof(master_confirm));
     return;
   }
 
-  // Create search message
   master_confirm confirmMessage;
   memcpy(&confirmMessage, incomingData, sizeof(confirmMessage));
-
-  Serial.println("\n=== MASTER CONFIRMATION RECEIVED ===");
-  Serial.print("Master MAC: ");
-  printMac(senderMac);
-  Serial.println();
 
   memcpy(master_mac, senderMac, 6);
   slaveID = confirmMessage.slaveID;
@@ -714,7 +765,7 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
 
   // Adding the master to ESP-NOW peer table
   if (!addMasterPeer(master_mac)) {
-    Serial.println("Failed to register Master");
+    slogw("MASTER", "failed to register master");
     return;
   }
 
@@ -722,10 +773,9 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
   master_found = true;
   received_confirm = true;
 
-  Serial.printf("Slave ID: %d\n", slaveID);
-
-  Serial.println("Master successfully registered!");
-  Serial.println("Channel hopping stopped.");
+  char mac[18];
+  macToStr(master_mac, mac);
+  slog("MASTER", "registered %s | slave ID %d | ch %d", mac, slaveID, active_channel);
 }
 
 // When master is polling for reading reports
@@ -735,7 +785,7 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   // Check if the message type is incorrectly assigned to the data
   // So it is actually not a master_request data
   if (len != sizeof(master_request)) {
-    Serial.println("Invalid master_request size");
+    slogw("REQ", "invalid master_request size: %d (expected %u)", len, (unsigned)sizeof(master_request));
     return;
   }
 
@@ -753,10 +803,6 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   bool tempOk = request.airTempValid &&
                 request.airTemp >= TDS_TEMP_MIN && request.airTemp <= TDS_TEMP_MAX;
   tdsTempC = tempOk ? request.airTemp : TDS_TEMP_DEFAULT;
-  Serial.printf("TDS temperature: %.1f C (%s)\n", (float)tdsTempC, tempOk ? "from misting" : "default");
-
-  Serial.println("\n=== MASTER REQUEST RECEIVED ===");
-  Serial.printf("Request for Slave ID: %d\n", request.slaveID);
 
   // consistent snapshot of the last state (not guaranted to be the actual latest / current)
   SlaveState s;
@@ -787,8 +833,8 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
 
   size_t jsonLen = measureJson(report);
   if (report.overflowed() || jsonLen >= sizeof(reading.reportBuffer)) {
-    Serial.printf("Report too large: %u/%u bytes. Not sent.\n",
-                  (unsigned)jsonLen, (unsigned)(sizeof(reading.reportBuffer) - 1));
+    slogw("REQ", "report too large: %u/%u B, not sent",
+          (unsigned)jsonLen, (unsigned)(sizeof(reading.reportBuffer) - 1));
     return;
   }
   serializeJson(report, reading.reportBuffer, sizeof(reading.reportBuffer));
@@ -796,9 +842,11 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   // send the created message by unicast
   // header + JSON + '\0'
   size_t packetLen = READING_HEADER_SIZE + jsonLen + 1;
-  sendToMaster((uint8_t *)&reading, packetLen);
-
-  Serial.printf("Reading sent (%u bytes): %s\n", (unsigned)packetLen, reading.reportBuffer);
+  bool sent = sendToMaster((uint8_t *)&reading, packetLen);
+  slog("REQ", "#%lu tds-temp %.1fC (%s) -> %s, %u B", (unsigned long)reqTime,
+       (float)tdsTempC, tempOk ? "misting" : "default",
+       sent ? "reading sent" : "SEND FAILED", (unsigned)packetLen);
+  slogd("REQ", "payload %s", reading.reportBuffer);
 }
 
 /* =====================================================
@@ -806,30 +854,15 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
    ===================================================== */
 
 void onDataRecv( const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-  Serial.printf("\nReceived data from " MACSTR " | Length: %d\n", MAC2STR(info->src_addr), len);
-
-  if (len < 1) {
+  if (len < 7) {
+    slogw("NOW", "packet too short (%d B)", len);
     return;
   }
 
   uint8_t msgType;
-
-  /*
-     all message struct has msgType in the 6th byte
-     Check if the packet has at least the minimum size
-  */
-
-  if (len < 7) {
-    Serial.println("Packet too short");
-    return;
-  }
-
-  // store the message type in a variable
   memcpy(&msgType, incomingData + 6, sizeof(msgType));
+  slogd("NOW", "rx type %d, %d B from " MACSTR, msgType, len, MAC2STR(info->src_addr));
 
-  Serial.printf("Message type: %d\n", msgType);
-
-  // call apropriate handler based on the message type
   switch (msgType) {
     case MSG_MASTER_CONFIRM:
       onMasterConfirm(incomingData, len, info->src_addr);
@@ -842,7 +875,7 @@ void onDataRecv( const esp_now_recv_info_t *info, const uint8_t *incomingData, i
     // add new message handler here
 
     default:
-      Serial.println("Unknown message type");
+      slogw("NOW", "unknown message type %d", msgType);
       break;
   }
 }
@@ -856,9 +889,7 @@ void setup() {
   initSensorsAndRelays();
   delay(1000);
 
-  Serial.println("\n==============================");
-  Serial.println("  IRRIGATION SLAVE STARTING");
-  Serial.println("==============================");
+  slog("BOOT", "irrigation slave starting");
 
   schedules.reserve(8);
   initSchedules();
@@ -872,19 +903,11 @@ void setup() {
   // Set default channel
   esp_wifi_set_channel(DEFAULT_SLAVE_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-  Serial.printf("Slave channel: %d\n", DEFAULT_SLAVE_CHANNEL);
-
-  Serial.print("Slave MAC: ");
-  Serial.println(WiFi.macAddress());
-
   // Initialize ESP-NOW
   esp_err_t result = esp_now_init();
 
   if (result != ESP_OK) {
-    Serial.printf(
-      "ESP-NOW initialization failed: %s\n",
-      esp_err_to_name(result)
-    );
+    slogw("BOOT", "ESP-NOW init failed: %s", esp_err_to_name(result));
 
     while (true) {
       delay(1000);
@@ -895,20 +918,12 @@ void setup() {
   result = esp_now_register_recv_cb(onDataRecv);
 
   if (result != ESP_OK) {
-    Serial.printf(
-      "Failed to register callback: %s\n",
-      esp_err_to_name(result)
-    );
+    slogw("BOOT", "failed to register recv callback: %s", esp_err_to_name(result));
 
     while (true) {
       delay(1000);
     }
   }
-
-  Serial.println("ESP-NOW initialized successfully.");
-  Serial.println("Receive callback registered.");
-
-  Serial.println("\nSearching for Master...");
 
   /*
      Broadcast peer needed for sending broadcast
@@ -933,14 +948,17 @@ void setup() {
   result = esp_now_add_peer(&broadcastPeer);
 
   if (result != ESP_OK && result != ESP_ERR_ESPNOW_EXIST) {
-    Serial.printf( "Failed to add broadcast peer: %s\n",esp_err_to_name(result)
-    );
+    slogw("BOOT", "failed to add broadcast peer: %s", esp_err_to_name(result));
   }
 
-   // search for master runs non-blocking from loop()
-  startSearch();
+  uint8_t m[6];
+  char mac[18];
+  WiFi.macAddress(m);
+  macToStr(m, mac);
+  slog("BOOT", "MAC %s | ch %d | ESP-NOW ready", mac, DEFAULT_SLAVE_CHANNEL);
 
-  Serial.println("\nSetup complete. Searching for Master from loop()...");
+  // Search for master runs non-blocking from loop().
+  startSearch();
 }
 
 /* =====================================================
@@ -948,20 +966,19 @@ void setup() {
    ===================================================== */
 
 void loop() {
-    // master confirmed (set by callback in WiFi task): pull radio to master's channel.
-  // The radio may have stopped on an overlapping neighbour channel while searching.
+  // Master confirmation is set by the WiFi callback; move the radio to its channel.
   if (received_confirm) {
     received_confirm = false;
     esp_wifi_set_channel(active_channel, WIFI_SECOND_CHAN_NONE);
     current_scan_channel = active_channel;
     lastRequestTime = millis();
-    Serial.printf("Radio synced to master channel %d\n", active_channel);
+    slogd("MASTER", "radio synced to master channel %d", active_channel);
   }
 
   if (master_found) {
     // master was registered but no request arrives: master/router may have rebooted
     if (millis() - lastRequestTime >= REQ_INT) {
-      Serial.println("No master request within REQ_INT. Searching master again...");
+      slogw("MASTER", "no request for %d s, searching again", REQ_INT / 1000);
       master_found = false;
       startSearch();
     }
@@ -983,49 +1000,9 @@ void loop() {
 
   static unsigned long lastDebug = 0;
 
-  // print debug each interval of DEBUG_INTERVAL sec
   if (millis() - lastDebug >= DEBUG_INT) {
     lastDebug = millis();
-
-    Serial.println("\n=== SLAVE STATUS ===");
-
-    Serial.print("Master connected: ");
-    Serial.println(master_found ? "YES" : "NO");
-
-    Serial.print("Master MAC: ");
-
-    if (master_found) {
-      printMac(master_mac);
-    } else {
-      Serial.print("None");
-    }
-
-    Serial.println();
-
-    Serial.printf("Slave ID: %d\n", slaveID);
-
-    int64_t localEpoch = getLocalEpoch();
-    if (localEpoch < 0) {
-      Serial.println("Time: not synced");
-    } else {
-      time_t t = (time_t)localEpoch;     // +7
-      struct tm tmv;
-      char tbuf[48];
-      gmtime_r(&t, &tmv);
-      strftime(tbuf, sizeof(tbuf), "%A, %B %d %Y %H:%M:%S", &tmv);
-      Serial.printf("Time (WIB): %s\n", tbuf);
-    }
-
-        if (lastDayNumber < 0) {
-      Serial.println("Next schedule: - (waiting for time/schedules)");
-    } else {
-      char a[9];
-      formatSecondOfDay(nextSchedule_time.start, a, sizeof(a));
-      Serial.printf("Next schedule: %s%s | pump: %s\n", a,
-                    nextIsTomorrow ? " (tomorrow)" : "", isExecutingSchedule ? "ON" : "OFF");
-    }
-
-    Serial.printf("Active channel: %d\n", active_channel);
+    printStatus();
   }
 
   delay(100);
