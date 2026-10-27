@@ -97,8 +97,9 @@ typedef struct __attribute__((packed)) {
   uint32_t reqTime;          // master millis() when polling, used as polling ID
   float   airTemp;           // misting air temperature relayed by master (C)
   uint8_t airTempValid;      // 1 = airTemp usable, 0 = slave must use its default
+  uint32_t epoch;            // UTC epoch (second) from NTP; 0 = master time is invalid
 } master_request;
-static_assert(sizeof(master_request) == 39, "master_request size mismatch");
+static_assert(sizeof(master_request) == 43, "master_request size mismatch");
 
 // 3. Slave reading report
 typedef struct __attribute__((packed)) {
@@ -1487,6 +1488,9 @@ void setup() {
   Serial.print("Master MAC: ");
   Serial.println(WiFi.macAddress());
 
+  // jeda untuk koneksi NTP server
+  delay(1500);
+
   /*
      ESP-NOW initialization
   */
@@ -1641,6 +1645,7 @@ void loop() {
       requestMessage.reqTime = (uint32_t)lastPolling;   // one timestamp for each polling cycle
       requestMessage.airTemp = mistValid ? mistTemp : 0.0f;
       requestMessage.airTempValid = mistValid ? 1 : 0;
+      requestMessage.epoch = isTimeValid() ? (uint32_t)time(nullptr) : 0;
 
       Serial.printf("Requesting Slave #%d (", slave.slaveID);
       printMac(slave.mac);

@@ -4,6 +4,13 @@
 #include <esp_wifi.h>
 #include <string.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <nvs.h>
+#include <nvs_flash.h>
+#include <vector>
+#include <algorithm>
+#include <esp_timer.h>
+#include <time.h>
 
 /* === DEFINITIONS === */
 
@@ -30,8 +37,9 @@
 #define pin_WaterUS_Trig 5
 #define pin_FertUS_Echo 4
 #define pin_FertUS_Trig 19
-#define pin_FertPH 36
-#define pin_FertTDS 39
+#define pin_FertTemp 36
+#define pin_FertPH 39
+#define pin_FertTDS 34
 #define pin_SoilMoist 33
 #define pin_SoilPH 32
 
@@ -44,6 +52,16 @@
 #define READING_PACKET_MAX  250   // batas payload ESP-NOW
 #define READING_HEADER_SIZE 24    // srcAddr(6)+msgType(1)+slaveID(1)+slaveType(16)
 #define REPORT_BUFFER_SIZE  (READING_PACKET_MAX - READING_HEADER_SIZE)  // 226
+
+// Schedule (NVS)
+#define NVS_SCHEDULE_NAMESPACE "saved_schedules"   // 15 karakter = batas NVS
+#define SECONDS_PER_DAY        86400UL
+static_assert(sizeof(NVS_SCHEDULE_NAMESPACE) - 1 <= 15, "NVS namespace max 15 chars");
+
+// Time sync
+#define TIME_RESYNC_THRESHOLD_MS 2000     // epoch baru diterapkan hanya jika selisih >= ini
+#define MIN_VALID_EPOCH          1700000000UL   // samakan dengan master
+#define WIB_OFFSET_S             25200L   // UTC+7, tanpa DST
 
 /* === MESSAGE TYPES ==== */
 
@@ -79,8 +97,9 @@ typedef struct __attribute__((packed)) {
   uint32_t reqTime;          // master millis() when polling
   float   airTemp;           // misting air temperature relayed by master (C)
   uint8_t airTempValid;      // 1 = airTemp usable
+  uint32_t epoch;            // UTC epoch (second) from NTP; 0 = master time is invalid
 } master_request;
-static_assert(sizeof(master_request) == 39, "master_request size mismatch");
+static_assert(sizeof(master_request) == 43, "master_request size mismatch");
 
 // 3. Slave reading report
 typedef struct __attribute__((packed)) {
@@ -105,6 +124,24 @@ struct SlaveState {
   bool  isWaterSVActive;
   bool  isFertSVActive;
 };
+
+// Daily schedule. time in sec in day, 0..86400.
+struct schedule {
+  uint32_t start;   // start time
+  uint32_t stop;    // stop time (= start + duration), start < stop <= 86400
+};
+
+struct DefaultSchedule {
+  const char *key;          // "HH:MM"
+  uint32_t    durationSec;
+};
+
+const DefaultSchedule defaultSchedules[] = {
+  // {"08:00", 120}, {"12:00", 120}, {"16:00", 120}
+  {"13:09", 20}, {"13:11", 20}
+};
+
+std::vector<schedule> schedules;   // sorted ascending on start
 
 /* === GLOBAL VARIABLES === */
 
@@ -378,6 +415,277 @@ void searchMasterStep() {
 
 
 
+/* === TIME === */
+
+// Written from ESP-NOW callback (WiFi task), read from loop(): must be protected by mux
+portMUX_TYPE timeMux = portMUX_INITIALIZER_UNLOCKED;
+int64_t timeOffsetMs = 0;     // epoch_UTC_ms - uptime_ms
+bool    timeSynced   = false;
+
+int64_t uptimeMs() { return esp_timer_get_time() / 1000; }
+
+// epoch = UTC from master, rxMs = uptimeMs() when packet is received
+void syncTime(uint32_t epoch, int64_t rxMs) {
+  if (epoch < MIN_VALID_EPOCH) return;   // master time is invalid
+
+  int64_t newOffset = (int64_t)epoch * 1000 - rxMs;
+  bool applied, first;
+  int64_t diff;
+
+  portENTER_CRITICAL(&timeMux);
+  first = !timeSynced;
+  diff = newOffset - timeOffsetMs;
+  applied = first || diff >= TIME_RESYNC_THRESHOLD_MS || diff <= -TIME_RESYNC_THRESHOLD_MS;
+  if (applied) {
+    timeOffsetMs = newOffset;
+    timeSynced = true;
+  }
+  portEXIT_CRITICAL(&timeMux);
+
+  if (applied) {
+    if (first) Serial.println("Time: first sync from master.");
+    else Serial.printf("Time: resync step %lld ms\n", (long long)diff);
+  }
+}
+
+// Local WIB epoch (second), -1 if not synced
+int64_t getLocalEpoch() {
+  portENTER_CRITICAL(&timeMux);
+  bool ok = timeSynced;
+  int64_t off = timeOffsetMs;
+  portEXIT_CRITICAL(&timeMux);
+  if (!ok) return -1;
+  return (uptimeMs() + off) / 1000 + WIB_OFFSET_S;
+}
+
+// sec-in-day WIB (0..86399), -1 if not synced
+int32_t getLocalSecondOfDay() {
+  int64_t t = getLocalEpoch();
+  return t < 0 ? -1 : (int32_t)(t % (int64_t)SECONDS_PER_DAY);
+}
+
+// Nomor hari lokal WIB, -1 if not synced
+int32_t getLocalDayNumber() {
+  int64_t t = getLocalEpoch();
+  return t < 0 ? -1 : (int32_t)(t / (int64_t)SECONDS_PER_DAY);
+}
+
+
+
+/* === SCHEDULE === */
+
+// "HH:MM" -> sec-in-day. false if format/range is incorrect.
+bool parseScheduleKey(const char *key, uint32_t &startSec) {
+  if (strlen(key) != 5 || key[2] != ':' ||
+      !isdigit((unsigned char)key[0]) || !isdigit((unsigned char)key[1]) ||
+      !isdigit((unsigned char)key[3]) || !isdigit((unsigned char)key[4])) return false;
+  int h = (key[0] - '0') * 10 + (key[1] - '0');
+  int m = (key[3] - '0') * 10 + (key[4] - '0');
+  if (h > 23 || m > 59) return false;
+  startSec = (uint32_t)h * 3600UL + (uint32_t)m * 60UL;
+  return true;
+}
+
+void formatSecondOfDay(uint32_t sec, char *buf, size_t len) {
+  snprintf(buf, len, "%02lu:%02lu:%02lu",
+           (unsigned long)(sec / 3600), (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60));
+}
+
+// Seed 3 default schedule to NVS (key "HH:MM", stop value is in sec-in-day)
+bool seedDefaultSchedules() {
+  Preferences prefs;
+  if (!prefs.begin(NVS_SCHEDULE_NAMESPACE, false)) return false;
+
+  bool ok = true;
+  for (const auto &d : defaultSchedules) {
+    uint32_t startSec;
+    if (!parseScheduleKey(d.key, startSec)) { ok = false; continue; }
+    if (prefs.putUInt(d.key, startSec + d.durationSec) == 0) ok = false;
+  }
+  prefs.end();
+  return ok;
+}
+
+// Read all NVS entry to 'out' (unsorted). Invalid entri is skipped and logged.
+// Return: number of raw entry in NVS (including the invalid(s) one); 0 = empty namespace.
+size_t readScheduleEntries(std::vector<schedule> &out) {
+  out.clear();
+
+  Preferences prefs;
+  if (!prefs.begin(NVS_SCHEDULE_NAMESPACE, false)) {
+    Serial.println("Schedule: failed to open NVS namespace.");
+    return 0;
+  }
+
+  size_t entries = 0;
+  nvs_iterator_t it = NULL;
+  esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_SCHEDULE_NAMESPACE, NVS_TYPE_U32, &it);
+
+  while (err == ESP_OK && it != NULL) {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+    entries++;
+
+    uint32_t startSec = 0;
+    uint32_t stopSec  = prefs.getUInt(info.key, 0);
+
+    if (!parseScheduleKey(info.key, startSec)) {
+      Serial.printf("Schedule: skip key=%s (invalid key)\n", info.key);
+    } else if (stopSec <= startSec || stopSec > SECONDS_PER_DAY) {
+      Serial.printf("Schedule: skip key=%s (invalid stop=%lu)\n", info.key, (unsigned long)stopSec);
+    } else {
+      out.push_back({startSec, stopSec});
+    }
+
+    err = nvs_entry_next(&it);   // it = NULL if there is more entry
+  }
+
+  if (it) nvs_release_iterator(it);
+  prefs.end();
+  return entries;
+}
+
+// ascending based on start, remove duplicates, store to 'schedules'
+void buildSchedules(std::vector<schedule> &raw) {
+  std::sort(raw.begin(), raw.end(),
+            [](const schedule &a, const schedule &b) { return a.start < b.start; });
+
+  schedules.clear();
+  for (const auto &s : raw) {
+    if (!schedules.empty() && s.start < schedules.back().stop) {
+      char a[9];
+      formatSecondOfDay(s.start, a, sizeof(a));
+      Serial.printf("Schedule: skip %s (overlaps previous schedule)\n", a);
+      continue;
+    }
+    schedules.push_back(s);
+  }
+}
+
+void printSchedules() {
+  Serial.printf("Schedules loaded: %u\n", (unsigned)schedules.size());
+  for (size_t i = 0; i < schedules.size(); i++) {
+    char a[9], b[9];
+    formatSecondOfDay(schedules[i].start, a, sizeof(a));
+    formatSecondOfDay(schedules[i].stop, b, sizeof(b));
+    Serial.printf("  #%u %s -> %s (%lu s)\n", (unsigned)i, a, b,
+                  (unsigned long)(schedules[i].stop - schedules[i].start));
+  }
+}
+
+// called once in setup(): seed default if NVS is empty, then export to 'schedules'
+void initSchedules() {
+  std::vector<schedule> raw;
+  size_t entries = readScheduleEntries(raw);
+
+  if (entries == 0) {
+    Serial.println("Schedule: NVS empty. Writing default schedules.");
+    if (!seedDefaultSchedules()) Serial.println("Schedule: failed to write defaults.");
+    readScheduleEntries(raw);
+  }
+
+  buildSchedules(raw);
+  printSchedules();
+}
+
+
+
+/* === SCHEDULE EXECUTION === */
+
+size_t   nextSchedule_i = 0;            // index of the next schedule in 'schedules'
+schedule nextSchedule_time = {0, 0};    // copy of schedules[nextSchedule_i]
+schedule curSchedule_time  = {0, 0};    // current or most recently executed schedule
+bool     nextIsTomorrow = false;        // true: nextSchedule_time = first schedule tomorrow
+bool     curScheduleDone = true;        // true: curSchedule_time already executed (or there isnt one)
+bool     isExecutingSchedule = false;   // true: pump is being activated (according to scheduke)
+unsigned long pumpStartMs = 0;
+unsigned long pumpRunMs   = 0;
+int32_t  lastDayNumber = -1;            // -1: not yet initialized schedule (waiting for valid time)
+
+// Bring nextSchedule_i back to the first daily schedule with start > nowSec. Passed schedule is ignored not removed,
+// if no more schedule today: back to 0 and flag it as tomorrow's schedule
+void getNextSchedule(uint32_t nowSec) {
+  if (schedules.empty()) return;
+
+  while (nextSchedule_i < schedules.size() && schedules[nextSchedule_i].start <= nowSec) {
+    nextSchedule_i++;
+  }
+  if (nextSchedule_i >= schedules.size()) {
+    nextSchedule_i = 0;
+    nextIsTomorrow = true;
+  }
+  nextSchedule_time = schedules[nextSchedule_i];
+}
+
+void startPump(unsigned long runMs) {
+  digitalWrite(pin_Pump, HIGH);
+  pumpStartMs = millis();
+  pumpRunMs = runMs;
+  isExecutingSchedule = true;
+  curScheduleDone = true;     // this schedule is already executed dont execute it again
+  Serial.printf("Pump ON for %lu s\n", runMs / 1000UL);
+}
+
+void stopPump() {
+  digitalWrite(pin_Pump, LOW);
+  isExecutingSchedule = false;
+  Serial.println("Pump OFF");
+}
+
+// Called first time of valid time and each day change
+void resyncSchedules(uint32_t nowSec) {
+  if (isExecutingSchedule) stopPump();   // make sure the previous day's schedule has stopped
+
+  nextSchedule_i = 0;
+  nextIsTomorrow = false;
+  getNextSchedule(nowSec);
+
+  // slave turns on or synced mid schedule: that schedule is still executed as long as its remaining time
+  curSchedule_time = {0, 0};
+  curScheduleDone = true;
+  for (const auto &s : schedules) {
+    if (s.start <= nowSec && nowSec < s.stop) {
+      curSchedule_time = s;
+      curScheduleDone = false;
+      break;
+    }
+  }
+}
+
+// Called in each loop() iteration
+void maintainSchedule() {
+  // Stop is based on millis(): keep running even if clock shift or not synced
+  if (isExecutingSchedule && millis() - pumpStartMs >= pumpRunMs) stopPump();
+
+  if (schedules.empty()) return;
+
+  int64_t t = getLocalEpoch();
+  if (t < 0) return;                      // not synced: pompa will not be activated
+  int32_t  day    = (int32_t)(t / (int64_t)SECONDS_PER_DAY);
+  uint32_t nowSec = (uint32_t)(t % (int64_t)SECONDS_PER_DAY);
+
+  if (lastDayNumber >= 0 && day < lastDayNumber) return;   // past mid night the clock moves backward
+  if (lastDayNumber < 0 || day > lastDayNumber) {
+    lastDayNumber = day;
+    resyncSchedules(nowSec);
+  }
+
+  // 1. next schedule start time has been passed
+  if (!nextIsTomorrow && nowSec >= nextSchedule_time.start) {
+    if (isExecutingSchedule) stopPump();
+    curSchedule_time = nextSchedule_time;
+    curScheduleDone = false;
+    getNextSchedule(nowSec);
+  }
+
+  // 2. active pump on interval [start, stop)
+  if (!isExecutingSchedule && !curScheduleDone &&
+      nowSec >= curSchedule_time.start && nowSec < curSchedule_time.stop) {
+    startPump((unsigned long)(curSchedule_time.stop - nowSec) * 1000UL);
+  }
+}
+
+
 /* =====================================================
    MESSAGE HANDLERS
    ===================================================== */
@@ -422,6 +730,8 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
 
 // When master is polling for reading reports
 void onMasterRequest( const uint8_t *incomingData, int len) {
+    int64_t rxMs = uptimeMs();
+
   // Check if the message type is incorrectly assigned to the data
   // So it is actually not a master_request data
   if (len != sizeof(master_request)) {
@@ -436,6 +746,7 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   master_request request;
 
   memcpy(&request, incomingData, sizeof(request));
+  syncTime(request.epoch, rxMs);
   uint32_t reqTime = request.reqTime;
 
   // air temperature of the misting slave (relayed by master) for TDS compensation
@@ -549,6 +860,9 @@ void setup() {
   Serial.println("  IRRIGATION SLAVE STARTING");
   Serial.println("==============================");
 
+  schedules.reserve(8);
+  initSchedules();
+
   WiFi.mode(WIFI_STA);
 
   WiFi.disconnect();
@@ -655,7 +969,9 @@ void loop() {
     searchMasterStep();
   }
 
-    // read all sensors every NEW_INT and publish the snapshot
+  maintainSchedule();
+
+  // read all sensors every NEW_INT and publish the snapshot
   static unsigned long lastNewState = 0;
   static bool firstState = true;
   if (firstState || millis() - lastNewState >= NEW_INT) {
@@ -688,11 +1004,28 @@ void loop() {
 
     Serial.printf("Slave ID: %d\n", slaveID);
 
-    Serial.printf("Active channel: %d\n", active_channel);
+    int64_t localEpoch = getLocalEpoch();
+    if (localEpoch < 0) {
+      Serial.println("Time: not synced");
+    } else {
+      time_t t = (time_t)localEpoch;     // +7
+      struct tm tmv;
+      char tbuf[48];
+      gmtime_r(&t, &tmv);
+      strftime(tbuf, sizeof(tbuf), "%A, %B %d %Y %H:%M:%S", &tmv);
+      Serial.printf("Time (WIB): %s\n", tbuf);
+    }
 
-    uint8_t pri; wifi_second_chan_t sec;
-    esp_wifi_get_channel(&pri, &sec);
-    Serial.printf("Radio channel (actual): %d\n", pri);
+        if (lastDayNumber < 0) {
+      Serial.println("Next schedule: - (waiting for time/schedules)");
+    } else {
+      char a[9];
+      formatSecondOfDay(nextSchedule_time.start, a, sizeof(a));
+      Serial.printf("Next schedule: %s%s | pump: %s\n", a,
+                    nextIsTomorrow ? " (tomorrow)" : "", isExecutingSchedule ? "ON" : "OFF");
+    }
+
+    Serial.printf("Active channel: %d\n", active_channel);
   }
 
   delay(100);
