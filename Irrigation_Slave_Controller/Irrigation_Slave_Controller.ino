@@ -12,6 +12,8 @@
 #include <esp_timer.h>
 #include <time.h>
 #include <stdarg.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 
 /* === DEFINITIONS === */
 
@@ -25,11 +27,6 @@
 #define NEW_INT 2000         // ms; interval of reading all sensors (newSlaveState)
 // #define SENSOR_DEBUG   // enable raw/state sensor lines on each NEW_INT (for calibration)
 // #define LOG_DEBUG      // enable raw ESP-NOW packets, JSON payloads, and each search channel
-
-// Temperature value from misting slave
-#define TDS_TEMP_DEFAULT 25.0f   // C; used when master has no misting temperature
-#define TDS_TEMP_MIN 0.0f
-#define TDS_TEMP_MAX 60.0f
 
 // pins
 #define pin_WaterSV 26
@@ -132,6 +129,7 @@ struct SlaveState {
   float soilPH;
   float fertPH;
   float fertTDS;           // ppm
+  float fertTemp;
   bool  isPumpActive;
   bool  isWaterSVActive;
   bool  isFertSVActive;
@@ -170,17 +168,21 @@ bool searchStepPending = false;         // true -> next searchMasterStep() runs 
 bool master_peer_added = false;
 volatile unsigned long lastRequestTime = 0;
 
+// Sensor instance
+OneWire oneWire(pin_FertTemp);
+DallasTemperature tempSensor(&oneWire);
+
 // Calibration constants.
 // All are PLACEHOLDERS until calibrated (see checklist).
-const int   AirValue   = 3500;    // raw ADC (0-4095) in dry air
-const int   WaterValue = 1300;    // raw ADC in water/saturated soil
+const int   AirValue     = 3500;  // raw ADC (0-4095) in dry air
+const int   WaterValue   = 1300;  // raw ADC in water/saturated soil
 const float fertPH_V7    = 2.50f; // volt at pH 7 (PH-4502C)
 const float fertPH_Slope = 0.18f; // volt per pH unit (V at pH4 minus V at pH7, divided by 3)
 const float soilPH_V7    = 2.50f; // PLACEHOLDER, sensor output unknown
 const float soilPH_Slope = 0.18f; // PLACEHOLDER
 const float tdsK         = 1.0f;  // TDS correction factor (standard solution / reading)
+const float default_temp = 25.0f; // default value used if temp sensor faild
 
-volatile float tdsTempC = TDS_TEMP_DEFAULT;  // water temperature for TDS compensation (overwrited in the future)
 const uint16_t tdsGapMs = 40;                 // delay between TDS samples
 const unsigned long echoTimeoutUs = 30000;
 
@@ -253,10 +255,10 @@ float distanceToLevel(float distCm) {
 }
 
 // TDS (ppm); returns the median millivolts through medianMv for debugging
-float readTDS(int &medianMv) {
+float readTDS(int &medianMv, temp) {
   medianMv = readMedianMilliVolts(pin_FertTDS, SCOUNT, tdsGapMs);
   float voltage = medianMv / 1000.0f;
-  float compensationCoefficient = 1.0f + 0.02f * (tdsTempC - 25.0f);
+  float compensationCoefficient = 1.0f + 0.02f * (temp - 25.0f);
   float v = voltage / compensationCoefficient;
   float tds = (133.42f * v * v * v - 255.86f * v * v + 857.39f * v) * 0.5f;
   return tds * tdsK;
@@ -272,6 +274,12 @@ SlaveState newSlaveState() {
   int soilPH_mV = readMedianMilliVolts(pin_SoilPH, 1, 0);
   s.fertPH = round2(phFromMilliVolts(fertPH_mV, fertPH_V7, fertPH_Slope));
   s.soilPH = round2(phFromMilliVolts(soilPH_mV, soilPH_V7, soilPH_Slope));
+
+  // 2. Water temperature
+  tempSensor.requestTemperatures(); // Send the command to get temperatures
+  float readTemp = getTempCByIndex(0);
+  float fertTemp = (readTemp != DEVICE_DISCONNECTED_C)? readTemp : default_temp;
+  s.fertTemp = fertTemp;
 
   // 2. ultrasonic -> level
   float waterDist = readDistanceCm(pin_WaterUS_Trig, pin_WaterUS_Echo);
@@ -290,13 +298,13 @@ SlaveState newSlaveState() {
 
   // 5. TDS last (SCOUNT samples, blocks ~1.2 s)
   int tds_mV = 0;
-  s.fertTDS = round2(readTDS(tds_mV));
+  s.fertTDS = round2(readTDS(tds_mV, fertTemp));
 
 #ifdef SENSOR_DEBUG
-    slog("SENSOR", "raw fertPH %dmV soilPH %dmV water %.1fcm fert %.1fcm soil %d tds %dmV @%.1fC",
-      fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, tds_mV, (float)tdsTempC);
-    slog("SENSOR", "state wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f TDS %.2f pump %d wSV %d fSV %d",
-      s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTDS,
+    slog("SENSOR", "raw fertPH %dmV soilPH %dmV water %.1fcm fert %.1fcm soil %d temp %.1fC tds %dmV",
+      fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, fertTemp, tds_mV);
+    slog("SENSOR", "state wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f fertTemp %.1fC TDS %.2f pump %d wSV %d fSV %d",
+      s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTemp, s.fertTDS,
       s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
 #endif
 
@@ -738,8 +746,8 @@ void printStatus() {
   s = slaveState;
   portEXIT_CRITICAL(&stateMux);
 
-  slog("SENSOR", "wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f TDS %.1f | relays %d/%d/%d",
-       s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTDS,
+  slog("SENSOR", "wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f fertTemp %.2f TDS %.1f | relays %d/%d/%d",
+       s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTemp, s.fertTDS,
        s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
 }
 
@@ -780,7 +788,7 @@ void onMasterConfirm(const uint8_t *incomingData, int len, const uint8_t *sender
 
 // When master is polling for reading reports
 void onMasterRequest( const uint8_t *incomingData, int len) {
-    int64_t rxMs = uptimeMs();
+  int64_t rxMs = uptimeMs();
 
   // Check if the message type is incorrectly assigned to the data
   // So it is actually not a master_request data
@@ -799,11 +807,6 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   syncTime(request.epoch, rxMs);
   uint32_t reqTime = request.reqTime;
 
-  // air temperature of the misting slave (relayed by master) for TDS compensation
-  bool tempOk = request.airTempValid &&
-                request.airTemp >= TDS_TEMP_MIN && request.airTemp <= TDS_TEMP_MAX;
-  tdsTempC = tempOk ? request.airTemp : TDS_TEMP_DEFAULT;
-
   // consistent snapshot of the last state (not guaranted to be the actual latest / current)
   SlaveState s;
   portENTER_CRITICAL(&stateMux);
@@ -819,13 +822,14 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
 
   // create json report
   JsonDocument report;
-  report["reqTime"]            = reqTime;
-  report["slaveID"]            = slaveID;
+  report["reqTime"]         = reqTime;
+  report["slaveID"]         = slaveID;
   report["waterLevel"]      = s.waterLevel;
   report["fertLevel"]       = s.fertLevel;
   report["soilMoist"]       = s.soilMoist;
   report["soilPH"]          = s.soilPH;
   report["fertPH"]          = s.fertPH;
+  report["fertTemp"]        = s.fertTemp;
   report["fertTDS"]         = s.fertTDS;
   report["isPumpActive"]    = s.isPumpActive;
   report["isWaterSVActive"] = s.isWaterSVActive;
@@ -959,6 +963,9 @@ void setup() {
 
   // Search for master runs non-blocking from loop().
   startSearch();
+
+  // start sensor
+  tempSensor.begin();
 }
 
 /* =====================================================
