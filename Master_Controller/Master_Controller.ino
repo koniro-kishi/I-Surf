@@ -13,6 +13,7 @@
 #include <nvs_flash.h>
 #include <time.h>
 #include <ArduinoJson.h>
+#include <algorithm>
 
 /* =====================================================
    CONFIGURATION
@@ -54,6 +55,19 @@
 #define DUMMY_MISTING                    // comment out when the real misting slave exists
 #define DUMMY_MIST_TEMP     28.0f        // dummy misting air temperature (C)
 #define MIN_VALID_EPOCH     1700000000UL // clock counts as set by NTP after Nov 2023
+
+// History aggregation
+#define HIST_BUCKET_MIN      1     // bucket length (minutes), aligned to wall clock
+#define HIST_CLOSE_GRACE_S   5     // seconds after bucket end before it is closed (late replies)
+#define HIST_MAX_SLAVES      8
+#define HIST_MAX_FIELDS      12    // distinct JSON keys per slave
+#define HIST_KEY_LEN         16    // incl. '\0'
+#define HISTORY_QUEUE_MAX    180   // aggregated records kept per slave (RAM ring); oldest dropped when full
+
+#define HIST_BUCKET_S        (HIST_BUCKET_MIN * 60UL)
+#define HIST_MAX_SAMPLES     (HIST_BUCKET_S * 1000UL / POLL_INTERVAL + 3)   // polling cycles per bucket + margin
+static_assert(HIST_BUCKET_MIN >= 1 && HIST_BUCKET_MIN <= 10,
+              "HIST_BUCKET_MIN > 10 needs a RAM review (sample buffers grow with it)");
 
 /* =====================================================
    MESSAGE TYPES AND SIZE
@@ -1333,6 +1347,192 @@ void cloudTask(void *) {
   }
 }
 
+
+// =====================================================
+// HISTORY AGGREGATION (per slave, per wall-clock bucket)
+// =====================================================
+
+struct HistField {
+  char     key[HIST_KEY_LEN];
+  bool     isBool;
+  uint16_t n;                          // samples of this field in the open bucket
+  float    v[HIST_MAX_SAMPLES];
+};
+
+struct HistRecord {
+  uint32_t bucketStart;                // epoch UTC (s), start of bucket
+  uint16_t n;                          // readings in the bucket
+  float    val[HIST_MAX_FIELDS];       // median (number) / fraction true (bool); NAN = no data
+};
+
+struct HistSlave {
+  uint8_t     slaveID;                 // 0 = slot unused (IDs start at 1)
+  uint8_t     nFields;
+  uint32_t    bucketStart;             // epoch of the open bucket
+  uint16_t    samples;                 // readings in the open bucket (0 = no open bucket)
+  uint32_t    lastCycle;               // cycleCounter of the last counted reading
+  HistField   f[HIST_MAX_FIELDS];
+  HistRecord *ring;                    // allocated on first closed bucket
+  uint16_t    head;                    // next write index
+  uint16_t    count;                   // valid records
+};
+
+HistSlave histSlaves[HIST_MAX_SLAVES];  // zero-initialised (static storage)
+
+static float histRound2(float x) { return roundf(x * 100.0f) / 100.0f; }
+
+static float histMedian(float *a, uint16_t n) {
+  std::sort(a, a + n);
+  return (n & 1) ? a[n / 2] : (a[n / 2 - 1] + a[n / 2]) / 2.0f;
+}
+
+static HistSlave *histSlot(uint8_t id) {
+  HistSlave *freeSlot = nullptr;
+  for (auto &h : histSlaves) {
+    if (h.slaveID == id) return &h;
+    if (h.slaveID == 0 && freeSlot == nullptr) freeSlot = &h;
+  }
+  if (freeSlot) freeSlot->slaveID = id;
+  return freeSlot;                      // nullptr when all slots are used
+}
+
+static HistField *histField(HistSlave &h, const char *key, bool isBool) {
+  for (uint8_t i = 0; i < h.nFields; i++) {
+    if (strncmp(h.f[i].key, key, HIST_KEY_LEN - 1) == 0) return &h.f[i];
+  }
+  if (h.nFields >= HIST_MAX_FIELDS) return nullptr;
+  HistField &f = h.f[h.nFields++];
+  strncpy(f.key, key, HIST_KEY_LEN - 1);
+  f.key[HIST_KEY_LEN - 1] = '\0';
+  f.isBool = isBool;
+  f.n = 0;
+  return &f;
+}
+
+static void histReset(HistSlave &h) {
+  h.samples = 0;
+  h.bucketStart = 0;
+  for (uint8_t i = 0; i < h.nFields; i++) h.f[i].n = 0;
+}
+
+static void histPrint(const HistSlave &h, const HistRecord &r) {
+  char ts[48] = "n/a";
+  formatTimestamp((time_t)r.bucketStart, ts, sizeof(ts));
+  Serial.printf("History: slave%u bucket %s (epoch %lu) n=%u, queued %u/%u\n",
+                h.slaveID, ts, (unsigned long)r.bucketStart, r.n,
+                h.count, (unsigned)HISTORY_QUEUE_MAX);
+  for (uint8_t i = 0; i < h.nFields; i++) {
+    if (isnan(r.val[i])) continue;
+    Serial.printf("  %s: %.2f%s\n", h.f[i].key, r.val[i], h.f[i].isBool ? " (fraction on)" : "");
+  }
+}
+
+// Aggregate the open bucket into one record and push it to the ring
+static void histClose(HistSlave &h) {
+  if (h.samples == 0) { histReset(h); return; }
+
+  if (h.ring == nullptr) {
+    h.ring = (HistRecord *)malloc(sizeof(HistRecord) * HISTORY_QUEUE_MAX);
+    if (h.ring == nullptr) {
+      Serial.printf("History: slave%u out of memory. Bucket dropped.\n", h.slaveID);
+      histReset(h);
+      return;
+    }
+  }
+
+  if (h.count == HISTORY_QUEUE_MAX) {
+    Serial.printf("History: slave%u queue full. Oldest record dropped.\n", h.slaveID);
+  }
+
+  HistRecord &r = h.ring[h.head];
+  r.bucketStart = h.bucketStart;
+  r.n = h.samples;
+  for (uint8_t i = 0; i < HIST_MAX_FIELDS; i++) r.val[i] = NAN;
+
+  for (uint8_t i = 0; i < h.nFields; i++) {
+    HistField &f = h.f[i];
+    if (f.n == 0) continue;
+    if (f.isBool) {
+      float sum = 0;
+      for (uint16_t j = 0; j < f.n; j++) sum += f.v[j];
+      r.val[i] = histRound2(sum / f.n);
+    } else {
+      r.val[i] = histRound2(histMedian(f.v, f.n));
+    }
+  }
+
+  h.head = (h.head + 1) % HISTORY_QUEUE_MAX;
+  if (h.count < HISTORY_QUEUE_MAX) h.count++;
+
+  histPrint(h, r);
+  histReset(h);
+}
+
+// Called from collectReading() for every valid reading of the current cycle
+void histAddReading(int id, JsonObject obj) {
+  static bool clockWarned = false;
+  if (cycleReqEpoch < (time_t)MIN_VALID_EPOCH) {
+    if (!clockWarned) {
+      Serial.println("History: clock not valid. Readings skipped.");
+      clockWarned = true;
+    }
+    return;
+  }
+  clockWarned = false;
+
+  HistSlave *h = histSlot((uint8_t)id);
+  if (h == nullptr) {
+    Serial.println("History: no free slave slot.");
+    return;
+  }
+  if (h->lastCycle == cycleCounter) return;   // duplicate reply in the same cycle
+
+  uint32_t bucket = ((uint32_t)cycleReqEpoch / HIST_BUCKET_S) * HIST_BUCKET_S;
+
+  if (h->samples > 0 && bucket < h->bucketStart) {
+    Serial.printf("History: slave%u reading older than open bucket. Ignored.\n", h->slaveID);
+    return;
+  }
+  if (h->samples > 0 && bucket > h->bucketStart) histClose(*h);
+  if (h->samples >= HIST_MAX_SAMPLES) {
+    Serial.printf("History: slave%u bucket sample overflow. Reading skipped.\n", h->slaveID);
+    return;
+  }
+
+  if (h->samples == 0) h->bucketStart = bucket;
+  h->lastCycle = cycleCounter;
+  h->samples++;
+
+  for (JsonPair kv : obj) {
+    const char *k = kv.key().c_str();
+    if (strcmp(k, "reqTime") == 0 || strcmp(k, "slaveID") == 0) continue;
+
+    JsonVariant v = kv.value();
+    bool isBool = v.is<bool>();
+    if (!isBool && !v.is<float>()) continue;           // strings / objects are not aggregated
+
+    float x = isBool ? (v.as<bool>() ? 1.0f : 0.0f) : v.as<float>();
+    if (!isfinite(x)) continue;
+
+    HistField *f = histField(*h, k, isBool);
+    if (f == nullptr) {
+      if (h->samples == 1) Serial.printf("History: slave%u field table full. '%s' ignored.\n", h->slaveID, k);
+      continue;
+    }
+    if (f->n < HIST_MAX_SAMPLES) f->v[f->n++] = x;
+  }
+}
+
+// Called every loop(): close buckets by the clock, so a silent slave does not leave one hanging
+void histMaintain() {
+  if (!isTimeValid()) return;
+  uint32_t now = (uint32_t)time(nullptr);
+  for (auto &h : histSlaves) {
+    if (h.samples > 0 && now >= h.bucketStart + HIST_BUCKET_S + HIST_CLOSE_GRACE_S) histClose(h);
+  }
+}
+
+
 // =====================================================
 // AGREGATE ONE POLLING CYCLE
 // =====================================================
@@ -1361,10 +1561,13 @@ void collectReading(int id, JsonObject obj) {
     Serial.println("Reading outside collect window. Ignored.");
     return;
   }
+
   if ((uint32_t)(obj["reqTime"] | 0u) != cycleReqTime) {
     Serial.println("Reading from an older cycle. Ignored.");
     return;
   }
+
+  histAddReading(id, obj);
 
   String key = "slave" + String(id);
   JsonObject dst = aggregate_rep["slaves"][key].to<JsonObject>();
@@ -1588,6 +1791,7 @@ void setup() {
 
 void loop() {
   processReadingQueue();
+  histMaintain();
 
   static unsigned long lastPolling = 0;
   static unsigned long lastStatus = 0;
