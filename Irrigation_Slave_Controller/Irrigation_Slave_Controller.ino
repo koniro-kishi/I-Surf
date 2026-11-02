@@ -36,7 +36,7 @@
 #define pin_WaterUS_Trig 5
 #define pin_FertUS_Echo 4
 #define pin_FertUS_Trig 19
-#define pin_FertTemp 36
+#define pin_FertTemp 23
 #define pin_FertPH 39
 #define pin_FertTDS 34
 #define pin_SoilMoist 33
@@ -46,6 +46,10 @@
 #define SCOUNT 30            // TDS sample points (median filter)
 #define SOUND_SPEED 0.034    // cm/us
 #define reservoirDepth 60    // cm, sensor to reservoir bottom (dummy)
+#define TEMP_MIN        0.0f   // C; outside these constraint is invalid
+#define TEMP_MAX        60.0f
+#define TEMP_RESOLUTION 10     // bit; ~190 ms, 0.25 C
+#define TDS_TEMP_DEFAULT 25.0
 
 // ESP-NOW
 #define READING_PACKET_MAX  250   // batas payload ESP-NOW
@@ -129,7 +133,7 @@ struct SlaveState {
   float soilPH;
   float fertPH;
   float fertTDS;           // ppm
-  float fertTemp;
+  float fertTemp;          // C; NAN = sensor gagal (dikirim sebagai null)
   bool  isPumpActive;
   bool  isWaterSVActive;
   bool  isFertSVActive;
@@ -190,6 +194,7 @@ const unsigned long echoTimeoutUs = 30000;
 // SlaveState slaveState = {0.9f, 0.5f, 0.1f, 0.6f, 0.2f, true, false, true};  // dummy
 SlaveState slaveState = {};
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+float tdsTempC;
 
 // Dipanggil dari loop() oleh kode pembacaan sensor nanti (belum dipanggil: data dummy)
 void updateSlaveState(const SlaveState &s) {
@@ -255,7 +260,7 @@ float distanceToLevel(float distCm) {
 }
 
 // TDS (ppm); returns the median millivolts through medianMv for debugging
-float readTDS(int &medianMv, temp) {
+float readTDS(int &medianMv, float temp) {
   medianMv = readMedianMilliVolts(pin_FertTDS, SCOUNT, tdsGapMs);
   float voltage = medianMv / 1000.0f;
   float compensationCoefficient = 1.0f + 0.02f * (temp - 25.0f);
@@ -275,11 +280,13 @@ SlaveState newSlaveState() {
   s.fertPH = round2(phFromMilliVolts(fertPH_mV, fertPH_V7, fertPH_Slope));
   s.soilPH = round2(phFromMilliVolts(soilPH_mV, soilPH_V7, soilPH_Slope));
 
-  // 2. Water temperature
-  tempSensor.requestTemperatures(); // Send the command to get temperatures
-  float readTemp = getTempCByIndex(0);
-  float fertTemp = (readTemp != DEVICE_DISCONNECTED_C)? readTemp : default_temp;
-  s.fertTemp = fertTemp;
+    // 2. Water temperature. Report NAN jika gagal; TDS use default_temp
+  tempSensor.requestTemperatures();
+  float readTemp = tempSensor.getTempCByIndex(0);
+  bool tempOk = (readTemp != DEVICE_DISCONNECTED_C) && (readTemp != 85.0f) &&
+                readTemp >= TEMP_MIN && readTemp <= TEMP_MAX;
+  s.fertTemp = tempOk ? round2(readTemp) : NAN;
+  tdsTempC = tempOk ? readTemp : default_temp;
 
   // 2. ultrasonic -> level
   float waterDist = readDistanceCm(pin_WaterUS_Trig, pin_WaterUS_Echo);
@@ -298,11 +305,11 @@ SlaveState newSlaveState() {
 
   // 5. TDS last (SCOUNT samples, blocks ~1.2 s)
   int tds_mV = 0;
-  s.fertTDS = round2(readTDS(tds_mV, fertTemp));
+  s.fertTDS = round2(readTDS(tds_mV, tdsTempC));
 
 #ifdef SENSOR_DEBUG
     slog("SENSOR", "raw fertPH %dmV soilPH %dmV water %.1fcm fert %.1fcm soil %d temp %.1fC tds %dmV",
-      fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, fertTemp, tds_mV);
+      fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, tdsTempC, tds_mV);
     slog("SENSOR", "state wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f fertTemp %.1fC TDS %.2f pump %d wSV %d fSV %d",
       s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTemp, s.fertTDS,
       s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
@@ -332,6 +339,9 @@ void initSensorsAndRelays() {
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
+
+  tempSensor.begin();
+  tempSensor.setResolution(TEMP_RESOLUTION);
 }
 
 
@@ -847,8 +857,7 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   // header + JSON + '\0'
   size_t packetLen = READING_HEADER_SIZE + jsonLen + 1;
   bool sent = sendToMaster((uint8_t *)&reading, packetLen);
-  slog("REQ", "#%lu tds-temp %.1fC (%s) -> %s, %u B", (unsigned long)reqTime,
-       (float)tdsTempC, tempOk ? "misting" : "default",
+  slog("REQ", "#%lu -> %s, %u B", (unsigned long)reqTime,
        sent ? "reading sent" : "SEND FAILED", (unsigned)packetLen);
   slogd("REQ", "payload %s", reading.reportBuffer);
 }
@@ -963,9 +972,6 @@ void setup() {
 
   // Search for master runs non-blocking from loop().
   startSearch();
-
-  // start sensor
-  tempSensor.begin();
 }
 
 /* =====================================================
