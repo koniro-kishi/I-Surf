@@ -146,6 +146,32 @@ struct CloudConfig {
 };
 CloudConfig cloudCfg;
 
+
+typedef struct {
+  char     key[HIST_KEY_LEN];
+  bool     isBool;
+  uint16_t n;                          // samples of this field in the open bucket
+  float    v[HIST_MAX_SAMPLES];
+} HistField;
+
+typedef struct {
+  uint32_t bucketStart;                // epoch UTC (s), start of bucket
+  uint16_t n;                          // readings in the bucket
+  float    val[HIST_MAX_FIELDS];       // median (number) / fraction true (bool); NAN = no data
+} HistRecord;
+
+typedef struct {
+  uint8_t     slaveID;                 // 0 = slot unused (IDs start at 1)
+  uint8_t     nFields;
+  uint32_t    bucketStart;             // epoch of the open bucket
+  uint16_t    samples;                 // readings in the open bucket (0 = no open bucket)
+  uint32_t    lastCycle;               // cycleCounter of the last counted reading
+  HistField   f[HIST_MAX_FIELDS];
+  HistRecord *ring;                    // allocated on first closed bucket
+  uint16_t    head;                    // next write index
+  uint16_t    count;                   // valid records
+} HistSlave;
+
 /* =====================================================
    SLAVE INFORMATION
    ===================================================== */
@@ -1351,31 +1377,6 @@ void cloudTask(void *) {
 // =====================================================
 // HISTORY AGGREGATION (per slave, per wall-clock bucket)
 // =====================================================
-
-struct HistField {
-  char     key[HIST_KEY_LEN];
-  bool     isBool;
-  uint16_t n;                          // samples of this field in the open bucket
-  float    v[HIST_MAX_SAMPLES];
-};
-
-struct HistRecord {
-  uint32_t bucketStart;                // epoch UTC (s), start of bucket
-  uint16_t n;                          // readings in the bucket
-  float    val[HIST_MAX_FIELDS];       // median (number) / fraction true (bool); NAN = no data
-};
-
-struct HistSlave {
-  uint8_t     slaveID;                 // 0 = slot unused (IDs start at 1)
-  uint8_t     nFields;
-  uint32_t    bucketStart;             // epoch of the open bucket
-  uint16_t    samples;                 // readings in the open bucket (0 = no open bucket)
-  uint32_t    lastCycle;               // cycleCounter of the last counted reading
-  HistField   f[HIST_MAX_FIELDS];
-  HistRecord *ring;                    // allocated on first closed bucket
-  uint16_t    head;                    // next write index
-  uint16_t    count;                   // valid records
-};
 
 HistSlave histSlaves[HIST_MAX_SLAVES];  // zero-initialised (static storage)
 
