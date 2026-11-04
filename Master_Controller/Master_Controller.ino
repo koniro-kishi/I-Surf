@@ -69,6 +69,11 @@
 static_assert(HIST_BUCKET_MIN >= 1 && HIST_BUCKET_MIN <= 10,
               "HIST_BUCKET_MIN > 10 needs a RAM review (sample buffers grow with it)");
 
+#define HIST_UPLOAD_BATCH     10      // records per PATCH (one slave per request)
+#define HIST_UPLOAD_MAX_FAIL  5       // consecutive HTTP 4xx before the head record(s) are dropped
+#define HIST_RETRY_MS         15000   // wait after a failed upload
+#define HIST_REC_JSON_MAX     520     // worst-case JSON bytes of one record
+
 /* =====================================================
    MESSAGE TYPES AND SIZE
    ===================================================== */
@@ -271,6 +276,22 @@ static unsigned long cloudTokenAt = 0;
 static unsigned long cloudTokenTtlMs = 0;
 static unsigned long cloudLastFail = 0;
 static unsigned long cloudRetryDelay = 0;  // 0 = currently not waiting
+
+// history upload: loop() -> cloudTask (body) and cloudTask -> loop() (result)
+struct HistUpload {
+  char    *body;         // malloc'd JSON {"<epoch>":{...},...}; freed by cloudTask
+  uint8_t  slaveID;
+  uint8_t  count;
+  uint32_t lastBucket;   // newest bucketStart contained in body
+};
+struct HistAck {
+  uint8_t  slaveID;
+  uint32_t lastBucket;
+  bool     ok;
+  bool     counts;       // true only for HTTP 4xx (rejected); network errors/timeouts do not count
+};
+QueueHandle_t historyQueue    = NULL;   // length 1
+QueueHandle_t historyAckQueue = NULL;   // length 1
 
 
 // I2C module
@@ -1319,8 +1340,11 @@ bool cloudSignIn() {
   return false;
 }
 
-// PATCH /latest.json. true jika berhasil.
-bool cloudPatchLatest(const char *payload) {
+// PATCH <path>.json. true on HTTP 200/204. httpCode (optional) receives the HTTP status (0 = never sent).
+// resetAuthOn401 = true  : /latest. A 401 clears the token and starts the sign-in backoff.
+// resetAuthOn401 = false : /history. A 401 can be a rules rejection, so it must not disturb the token or block /latest.
+bool cloudPatch(const char *path, const char *payload, bool resetAuthOn401, int *httpCode) {
+  if (httpCode) *httpCode = 0;
   bool tokenOk = cloudToken.length() > 0 && (millis() - cloudTokenAt) < cloudTokenTtlMs;
   if (!tokenOk && !cloudSignIn()) return false;
 
@@ -1328,7 +1352,7 @@ bool cloudPatchLatest(const char *payload) {
   http.setConnectTimeout(CLOUD_HTTP_TIMEOUT);
   http.setTimeout(CLOUD_HTTP_TIMEOUT);
 
-  String url = cloudCfg.dbUrl + "/latest.json?print=silent&auth=" + cloudToken;
+  String url = cloudCfg.dbUrl + path + ".json?print=silent&auth=" + cloudToken;
   if (!http.begin(dbClient, url)) {
     dbClient.stop();
     return false;
@@ -1336,19 +1360,19 @@ bool cloudPatchLatest(const char *payload) {
   http.addHeader("Content-Type", "application/json");
 
   int code = http.PATCH((uint8_t *)payload, strlen(payload));
+  if (httpCode) *httpCode = code;
   if (code == 200 || code == 204) {
     http.end();
-    Serial.println("Cloud: PATCH latest succeeded");
+    Serial.printf("Cloud: PATCH %s succeeded\n", path);
     return true;
   }
 
   String err = (code > 0) ? http.getString() : String();
   http.end();
-  Serial.printf("Cloud: PATCH latest failed (HTTP %d) %s\n", code, err.c_str());
+  Serial.printf("Cloud: PATCH %s failed (HTTP %d) %s\n", path, code, err.c_str());
 
   if (code < 0) dbClient.stop();   // koneksi rusak -> dibuka ulang di request berikut
-  if (code == 401) {
-    // 401 bisa berarti token kedaluwarsa ATAU ditolak rules; jangan login tiap siklus
+  if (code == 401 && resetAuthOn401) {
     cloudToken = "";
     cloudLastFail = millis();
     cloudRetryDelay = SIGNIN_RETRY_MS;
@@ -1361,15 +1385,31 @@ void cloudTask(void *) {
   bool reported = false;
 
   for (;;) {
+    // 1. latest: overwrite semantics, may be dropped
     char *payload = nullptr;
-    if (xQueueReceive(cloudQueue, &payload, portMAX_DELAY) != pdTRUE || payload == nullptr) continue;
-
-    if (wifiFlag == WifiState::CONNECTED && cloudPatchLatest(payload) && !reported) {
-      reported = true;
-      Serial.printf("Cloud: first upload OK. Task stack free: %u bytes\n",
-                    (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    if (xQueueReceive(cloudQueue, &payload, pdMS_TO_TICKS(200)) == pdTRUE && payload != nullptr) {
+      if (wifiFlag == WifiState::CONNECTED && cloudPatch("/latest", payload, true, nullptr) && !reported) {
+        reported = true;
+        Serial.printf("Cloud: first upload OK. Task stack free: %u bytes\n",
+                      (unsigned)uxTaskGetStackHighWaterMark(NULL));
+      }
+      free(payload);
     }
-    free(payload);
+
+    // 2. history: never dropped here, the result goes back to loop()
+    HistUpload u;
+    if (historyQueue != NULL && xQueueReceive(historyQueue, &u, 0) == pdTRUE) {
+      HistAck ack = {u.slaveID, u.lastBucket, false, false};
+      if (wifiFlag == WifiState::CONNECTED) {
+        char path[24];
+        snprintf(path, sizeof(path), "/history/slave%u", (unsigned)u.slaveID);
+        int code = 0;
+        ack.ok = cloudPatch(path, u.body, false, &code);
+        ack.counts = (code >= 400 && code < 500);
+      }
+      free(u.body);
+      xQueueSend(historyAckQueue, &ack, 0);
+    }
   }
 }
 
@@ -1424,7 +1464,7 @@ static void histPrint(const HistSlave &h, const HistRecord &r) {
                 h.count, (unsigned)HISTORY_QUEUE_MAX);
   for (uint8_t i = 0; i < h.nFields; i++) {
     if (isnan(r.val[i])) continue;
-    Serial.printf("  %s: %.2f%s\n", h.f[i].key, r.val[i], h.f[i].isBool ? " (fraction on)" : "");
+    Serial.printf("  %s%s: %.2f\n", h.f[i].key, h.f[i].isBool ? "_frac" : "", r.val[i]);
   }
 }
 
@@ -1530,6 +1570,130 @@ void histMaintain() {
   uint32_t now = (uint32_t)time(nullptr);
   for (auto &h : histSlaves) {
     if (h.samples > 0 && now >= h.bucketStart + HIST_BUCKET_S + HIST_CLOSE_GRACE_S) histClose(h);
+  }
+}
+
+// ---- history upload (runs in loop() context; the HTTP part lives in cloudTask) ----
+
+static bool histAppend(char *buf, size_t cap, size_t &pos, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(buf + pos, cap - pos, fmt, ap);
+  va_end(ap);
+  if (w < 0 || (size_t)w >= cap - pos) return false;
+  pos += (size_t)w;
+  return true;
+}
+
+// Serialise up to maxRec oldest records of one slave as {"<epoch>":{"n":..,"key":..},...}. Caller frees.
+static char *histBuildBody(const HistSlave &h, uint16_t maxRec, uint8_t &count, uint32_t &lastBucket) {
+  const size_t cap = (size_t)HIST_UPLOAD_BATCH * HIST_REC_JSON_MAX + 8;
+  char *buf = (char *)malloc(cap);
+  if (buf == nullptr) return nullptr;
+
+  size_t pos = 0;
+  histAppend(buf, cap, pos, "{");
+  count = 0;
+
+  uint16_t tail = (h.head + HISTORY_QUEUE_MAX - h.count) % HISTORY_QUEUE_MAX;
+  uint16_t take = h.count < maxRec ? h.count : maxRec;
+
+  for (uint16_t i = 0; i < take; i++) {
+    const HistRecord &r = h.ring[(tail + i) % HISTORY_QUEUE_MAX];
+    size_t save = pos;
+    bool ok = histAppend(buf, cap, pos, "%s\"%lu\":{\"n\":%u",
+                         count ? "," : "", (unsigned long)r.bucketStart, (unsigned)r.n);
+    for (uint8_t j = 0; ok && j < h.nFields; j++) {
+      if (isnan(r.val[j])) continue;
+      ok = histAppend(buf, cap, pos, ",\"%s%s\":%.2f",
+                      h.f[j].key, h.f[j].isBool ? "_frac" : "", r.val[j]);
+    }
+    if (ok) ok = histAppend(buf, cap, pos, "}");
+    if (!ok) { pos = save; break; }
+    count++;
+    lastBucket = r.bucketStart;
+  }
+
+  if (count == 0 || !histAppend(buf, cap, pos, "}")) {
+    free(buf);
+    return nullptr;
+  }
+  return buf;
+}
+
+// Remove records with bucketStart <= upToBucket from the tail (oldest side) of the ring
+static void histPop(HistSlave &h, uint32_t upToBucket) {
+  while (h.count > 0) {
+    uint16_t tail = (h.head + HISTORY_QUEUE_MAX - h.count) % HISTORY_QUEUE_MAX;
+    if (h.ring[tail].bucketStart > upToBucket) break;
+    h.count--;
+  }
+}
+
+void histUploadTick() {
+  if (historyQueue == NULL || historyAckQueue == NULL) return;
+
+  static bool inFlight = false;
+  static uint8_t flightSlot = 0;
+  static uint8_t failCount[HIST_MAX_SLAVES] = {0};
+  static unsigned long nextTry = 0;
+  static uint8_t rr = 0;                      // round robin start
+
+  // 1. result of the previous upload
+  HistAck ack;
+  if (xQueueReceive(historyAckQueue, &ack, 0) == pdTRUE) {
+    inFlight = false;
+    HistSlave &h = histSlaves[flightSlot];
+    bool drop = false;
+
+    if (ack.ok) {
+      failCount[flightSlot] = 0;
+      drop = true;
+      Serial.printf("History: slave%u uploaded up to %lu, %u left\n", ack.slaveID,
+                    (unsigned long)ack.lastBucket, (unsigned)h.count);
+    } else {
+      nextTry = millis() + HIST_RETRY_MS;
+      if (ack.counts && ++failCount[flightSlot] >= HIST_UPLOAD_MAX_FAIL) {
+        Serial.printf("History: slave%u rejected %u times. Dropping up to %lu.\n", ack.slaveID,
+                      (unsigned)HIST_UPLOAD_MAX_FAIL, (unsigned long)ack.lastBucket);
+        failCount[flightSlot] = 0;
+        drop = true;
+      } else {
+        Serial.printf("History: slave%u upload failed (%u/%u). Retry later.\n", ack.slaveID,
+                      (unsigned)failCount[flightSlot], (unsigned)HIST_UPLOAD_MAX_FAIL);
+      }
+    }
+    if (drop && h.slaveID == ack.slaveID) histPop(h, ack.lastBucket);
+  }
+
+  // 2. start the next upload
+  if (inFlight || wifiFlag != WifiState::CONNECTED) return;
+  if ((long)(millis() - nextTry) < 0) return;
+
+  for (uint8_t k = 0; k < HIST_MAX_SLAVES; k++) {
+    uint8_t s = (rr + k) % HIST_MAX_SLAVES;
+    HistSlave &h = histSlaves[s];
+    if (h.slaveID == 0 || h.count == 0) continue;
+
+    uint8_t cnt = 0;
+    uint32_t last = 0;
+    // after 2 rejections, send the oldest record alone to isolate a bad one
+    char *body = histBuildBody(h, failCount[s] >= 2 ? 1 : HIST_UPLOAD_BATCH, cnt, last);
+    if (body == nullptr) {
+      Serial.println("History: could not build upload body (heap?).");
+      nextTry = millis() + HIST_RETRY_MS;
+      return;
+    }
+
+    HistUpload u = {body, h.slaveID, cnt, last};
+    if (xQueueSend(historyQueue, &u, 0) != pdTRUE) {
+      free(body);
+      return;
+    }
+    inFlight = true;
+    flightSlot = s;
+    rr = (s + 1) % HIST_MAX_SLAVES;
+    return;
   }
 }
 
@@ -1773,11 +1937,15 @@ void setup() {
   // }
 
   if (cloudCfg.valid) {
-    cloudQueue = xQueueCreate(1, sizeof(char *));
-    if (cloudQueue == NULL ||
+    cloudQueue      = xQueueCreate(1, sizeof(char *));
+    historyQueue    = xQueueCreate(1, sizeof(HistUpload));
+    historyAckQueue = xQueueCreate(1, sizeof(HistAck));
+    if (cloudQueue == NULL || historyQueue == NULL || historyAckQueue == NULL ||
         xTaskCreate(cloudTask, "cloud", CLOUD_TASK_STACK, NULL, 1, NULL) != pdPASS) {
       Serial.println("Failed to start cloud task. Upload disabled.");
       cloudQueue = NULL;
+      historyQueue = NULL;
+      historyAckQueue = NULL;
     }
   }
 
@@ -1793,6 +1961,7 @@ void setup() {
 void loop() {
   processReadingQueue();
   histMaintain();
+  histUploadTick();
 
   static unsigned long lastPolling = 0;
   static unsigned long lastStatus = 0;
@@ -1820,6 +1989,10 @@ void loop() {
     Serial.printf("Active channel: %d\n", active_channel);
 
     Serial.printf("Free heap: %u bytes\n", (unsigned)ESP.getFreeHeap());
+
+    for (auto &h : histSlaves) {
+      if (h.slaveID != 0) Serial.printf("History queue slave%u: %u/%u\n", h.slaveID, h.count, (unsigned)HISTORY_QUEUE_MAX);
+    }
   }
 
   /*
