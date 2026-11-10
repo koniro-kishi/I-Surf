@@ -65,6 +65,7 @@ static_assert(sizeof(NVS_SCHEDULE_NAMESPACE) - 1 <= 15, "NVS namespace max 15 ch
 #define TIME_RESYNC_THRESHOLD_MS 2000     // epoch baru diterapkan hanya jika selisih >= ini
 #define MIN_VALID_EPOCH          1700000000UL   // samakan dengan master
 #define WIB_OFFSET_S             25200L   // UTC+7, tanpa DST
+#define HM(h, m) ((uint32_t)(h) * 3600UL + (uint32_t)(m) * 60UL)
 
 
 /* === MESSAGE TYPES ==== */
@@ -544,51 +545,19 @@ bool seedDefaultSchedules() {
 
   bool ok = true;
   for (const auto &d : defaultSchedules) {
-    uint32_t startSec;
-    if (!parseScheduleKey(d.key, startSec)) { ok = false; continue; }
-    if (prefs.putUInt(d.key, startSec + d.durationSec) == 0) ok = false;
+    if (d.start % 60 != 0 || d.stop <= d.start || d.stop > SECONDS_PER_DAY) {
+      slogw("SCHED", "invalid default schedule %lu-%lu, skipped",
+            (unsigned long)d.start, (unsigned long)d.stop);
+      ok = false;
+      continue;
+    }
+    char key[6];   // "HH:MM"
+    snprintf(key, sizeof(key), "%02lu:%02lu",
+             (unsigned long)(d.start / 3600), (unsigned long)((d.start / 60) % 60));
+    if (prefs.putUInt(key, d.stop) == 0) ok = false;
   }
   prefs.end();
   return ok;
-}
-
-// Read all NVS entry to 'out' (unsorted). Invalid entri is skipped and logged.
-// Return: number of raw entry in NVS (including the invalid(s) one); 0 = empty namespace.
-size_t readScheduleEntries(std::vector<schedule> &out) {
-  out.clear();
-
-  Preferences prefs;
-  if (!prefs.begin(NVS_SCHEDULE_NAMESPACE, false)) {
-    slogw("SCHED", "failed to open NVS namespace");
-    return 0;
-  }
-
-  size_t entries = 0;
-  nvs_iterator_t it = NULL;
-  esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_SCHEDULE_NAMESPACE, NVS_TYPE_U32, &it);
-
-  while (err == ESP_OK && it != NULL) {
-    nvs_entry_info_t info;
-    nvs_entry_info(it, &info);
-    entries++;
-
-    uint32_t startSec = 0;
-    uint32_t stopSec  = prefs.getUInt(info.key, 0);
-
-    if (!parseScheduleKey(info.key, startSec)) {
-      slogw("SCHED", "skip key '%s': invalid key", info.key);
-    } else if (stopSec <= startSec || stopSec > SECONDS_PER_DAY) {
-      slogw("SCHED", "skip key '%s': invalid stop %lu", info.key, (unsigned long)stopSec);
-    } else {
-      out.push_back({startSec, stopSec});
-    }
-
-    err = nvs_entry_next(&it);   // it = NULL if there is no more entry
-  }
-
-  if (it) nvs_release_iterator(it);
-  prefs.end();
-  return entries;
 }
 
 // ascending based on start, remove overlapping schedules, store to 'schedules'
