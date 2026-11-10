@@ -29,9 +29,8 @@
 // #define LOG_DEBUG      // enable raw ESP-NOW packets, JSON payloads, and each search channel
 
 // pins
-#define pin_WaterSV 26
-#define pin_FertSV 27
-#define pin_Pump 25
+#define pin_WaterPump 26
+#define pin_FertPump 27
 #define pin_WaterUS_Echo 18
 #define pin_WaterUS_Trig 5
 #define pin_FertUS_Echo 4
@@ -59,12 +58,14 @@
 // Schedule (NVS)
 #define NVS_SCHEDULE_NAMESPACE "saved_schedules"   // 15 karakter = batas NVS
 #define SECONDS_PER_DAY        86400UL
+#define FERT_CYCLE_DAYS          4        // Pump selection by day: day % FERT_CYCLE_DAYS == 0 -> fertigation, otherwise water (1 fert + 3 water)         
 static_assert(sizeof(NVS_SCHEDULE_NAMESPACE) - 1 <= 15, "NVS namespace max 15 chars");
 
 // Time sync
 #define TIME_RESYNC_THRESHOLD_MS 2000     // epoch baru diterapkan hanya jika selisih >= ini
 #define MIN_VALID_EPOCH          1700000000UL   // samakan dengan master
 #define WIB_OFFSET_S             25200L   // UTC+7, tanpa DST
+
 
 /* === MESSAGE TYPES ==== */
 
@@ -126,6 +127,10 @@ typedef struct __attribute__((packed)) {
 static_assert(offsetof(slave_reading, reportBuffer) == READING_HEADER_SIZE, "header size mismatch");
 static_assert(sizeof(slave_reading) == READING_PACKET_MAX, "slave_reading must be 250 bytes");
 
+enum class Reservoir : uint8_t { WATER, FERT };
+
+const char *reservoirName(Reservoir r) { return r == Reservoir::FERT ? "FERT" : "WATER"; }
+
 struct SlaveState {
   float waterLevel;        // 0-1
   float fertLevel;         // 0-1
@@ -133,10 +138,8 @@ struct SlaveState {
   float soilPH;
   float fertPH;
   float fertTDS;           // ppm
-  float fertTemp;          // C; NAN = sensor gagal (dikirim sebagai null)
-  bool  isPumpActive;
-  bool  isWaterSVActive;
-  bool  isFertSVActive;
+  bool  isPumpOn;          // true if either pump relay is HIGH
+  const char *useReservoir = "WATER";   // "WATER" or "FERT"; points to a string literal, safe to copy
 };
 
 // Daily schedule. time in sec in day, 0..86400.
@@ -195,6 +198,7 @@ const unsigned long echoTimeoutUs = 30000;
 SlaveState slaveState = {};
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 float tdsTempC;
+Reservoir todayReservoir = Reservoir::WATER;   // reservoir chosen for today; written only from loop()
 
 // Dipanggil dari loop() oleh kode pembacaan sensor nanti (belum dipanggil: data dummy)
 void updateSlaveState(const SlaveState &s) {
@@ -298,10 +302,9 @@ SlaveState newSlaveState() {
   int soilRaw = analogRead(pin_SoilMoist);
   s.soilMoist = round2(constrain((float)(AirValue - soilRaw) / (float)(AirValue - WaterValue), 0.0f, 1.0f));
 
-  // 4. relay state (active-HIGH)
-  s.isPumpActive    = (digitalRead(pin_Pump) == HIGH);
-  s.isWaterSVActive = (digitalRead(pin_WaterSV) == HIGH);
-  s.isFertSVActive  = (digitalRead(pin_FertSV) == HIGH);
+  // 4. pump state (relays active-HIGH)
+  s.isPumpOn = (digitalRead(pin_WaterPump) == HIGH) || (digitalRead(pin_FertPump) == HIGH);
+  s.useReservoir = reservoirName(todayReservoir);
 
   // 5. TDS last (SCOUNT samples, blocks ~1.2 s)
   int tds_mV = 0;
@@ -310,9 +313,9 @@ SlaveState newSlaveState() {
 #ifdef SENSOR_DEBUG
     slog("SENSOR", "raw fertPH %dmV soilPH %dmV water %.1fcm fert %.1fcm soil %d temp %.1fC tds %dmV",
       fertPH_mV, soilPH_mV, waterDist, fertDist, soilRaw, tdsTempC, tds_mV);
-    slog("SENSOR", "state wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f fertTemp %.1fC TDS %.2f pump %d wSV %d fSV %d",
-      s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTemp, s.fertTDS,
-      s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
+    slog("SENSOR", "state wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f TDS %.2f pump %d res %s",
+      s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTDS,
+      s.isPumpOn, s.useReservoir);
 #endif
 
   return s;
@@ -320,12 +323,10 @@ SlaveState newSlaveState() {
 
 // Pins and safe relay state. Called first in setup().
 void initSensorsAndRelays() {
-  pinMode(pin_WaterSV, OUTPUT);
-  pinMode(pin_FertSV, OUTPUT);
-  pinMode(pin_Pump, OUTPUT);
-  digitalWrite(pin_WaterSV, LOW);   // active-HIGH: LOW = off
-  digitalWrite(pin_FertSV, LOW);
-  digitalWrite(pin_Pump, LOW);
+  pinMode(pin_WaterPump, OUTPUT);
+  pinMode(pin_FertPump, OUTPUT);
+  digitalWrite(pin_WaterPump, LOW);   // active-HIGH: LOW = off
+  digitalWrite(pin_FertPump, LOW);
 
   pinMode(pin_WaterUS_Trig, OUTPUT);
   pinMode(pin_WaterUS_Echo, INPUT);
@@ -662,8 +663,13 @@ void getNextSchedule(uint32_t nowSec) {
   nextSchedule_time = schedules[nextSchedule_i];
 }
 
+uint8_t pumpPin(Reservoir r) { return r == Reservoir::FERT ? pin_FertPump : pin_WaterPump; }
+
 void startPump(unsigned long runMs) {
-  digitalWrite(pin_Pump, HIGH);
+  // exclusivity guard: both relays LOW first, then only the selected one goes HIGH
+  digitalWrite(pin_WaterPump, LOW);
+  digitalWrite(pin_FertPump, LOW);
+  digitalWrite(pumpPin(todayReservoir), HIGH);
   pumpStartMs = millis();
   pumpRunMs = runMs;
   isExecutingSchedule = true;
@@ -671,18 +677,27 @@ void startPump(unsigned long runMs) {
   char a[9], b[9];
   formatSecondOfDay(curSchedule_time.start, a, sizeof(a));
   formatSecondOfDay(curSchedule_time.stop, b, sizeof(b));
-  slog("PUMP", "ON for %lu s (schedule %s-%s)", runMs / 1000UL, a, b);
+  slog("PUMP", "%s ON for %lu s (schedule %s-%s)", reservoirName(todayReservoir), runMs / 1000UL, a, b);
 }
 
 void stopPump(const char *reason) {
-  digitalWrite(pin_Pump, LOW);
+  digitalWrite(pin_WaterPump, LOW);
+  digitalWrite(pin_FertPump, LOW);
   isExecutingSchedule = false;
   slog("PUMP", "OFF (%s)", reason);
 }
 
+// Reservoir for a local day number (WIB, >= 0). Pure function of the day: a reboot never shifts the cycle.
+Reservoir getReservoirForDay(int32_t day) {
+  return (day % FERT_CYCLE_DAYS == 0) ? Reservoir::FERT : Reservoir::WATER;
+}
+
 // Called first time of valid time and each day change
-void resyncSchedules(uint32_t nowSec) {
+void resyncSchedules(int32_t day, uint32_t nowSec) {
   if (isExecutingSchedule) stopPump("new day");   // make sure the previous day's schedule has stopped
+
+  todayReservoir = getReservoirForDay(day);
+  slog("SCHED", "day %ld: %s pump today", (long)day, reservoirName(todayReservoir));
 
   nextSchedule_i = 0;
   nextIsTomorrow = false;
@@ -715,7 +730,7 @@ void maintainSchedule() {
   if (lastDayNumber >= 0 && day < lastDayNumber) return;   // past mid night the clock moves backward
   if (lastDayNumber < 0 || day > lastDayNumber) {
     lastDayNumber = day;
-    resyncSchedules(nowSec);
+    resyncSchedules(day, nowSec);
   }
 
   // 1. next schedule start time has been passed
@@ -748,17 +763,17 @@ void printStatus() {
   wifi_second_chan_t sec;
   esp_wifi_get_channel(&pri, &sec);
 
-  slog("STATUS", "master %s | id %d | ch %d | next %s | pump %s",
-       mac, slaveID, pri, nxt, isExecutingSchedule ? "ON" : "OFF");
+  slog("STATUS", "master %s | id %d | ch %d | next %s | pump %s (%s)",
+    mac, slaveID, pri, nxt, isExecutingSchedule ? "ON" : "OFF", reservoirName(todayReservoir));
 
   SlaveState s;
   portENTER_CRITICAL(&stateMux);
   s = slaveState;
   portEXIT_CRITICAL(&stateMux);
 
-  slog("SENSOR", "wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f fertTemp %.2f TDS %.1f | relays %d/%d/%d",
-       s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTemp, s.fertTDS,
-       s.isPumpActive, s.isWaterSVActive, s.isFertSVActive);
+  slog("SENSOR", "wLvl %.2f fLvl %.2f moist %.2f soilPH %.2f fertPH %.2f TDS %.1f | pump %d res %s",
+    s.waterLevel, s.fertLevel, s.soilMoist, s.soilPH, s.fertPH, s.fertTDS,
+    s.isPumpOn, s.useReservoir);
 }
 
 
@@ -841,9 +856,8 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   report["fertPH"]          = s.fertPH;
   report["fertTemp"]        = s.fertTemp;
   report["fertTDS"]         = s.fertTDS;
-  report["isPumpActive"]    = s.isPumpActive;
-  report["isWaterSVActive"] = s.isWaterSVActive;
-  report["isFertSVActive"]  = s.isFertSVActive;
+  report["isPumpOn"]     = s.isPumpOn;
+  report["useReservoir"] = s.useReservoir;
 
   size_t jsonLen = measureJson(report);
   if (report.overflowed() || jsonLen >= sizeof(reading.reportBuffer)) {
