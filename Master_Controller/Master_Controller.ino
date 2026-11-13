@@ -14,6 +14,7 @@
 #include <time.h>
 #include <ArduinoJson.h>
 #include <algorithm>
+#include <freertos/semphr.h>
 
 /* =====================================================
    CONFIGURATION
@@ -49,6 +50,21 @@
 #define SIGNIN_RETRY_MS     30000   // delay after HTTP 401 (failed or denied connection)
 #define SIGNIN_BAD_CRED_MS  300000  // delay after HTTP 400 (wrong credential or configuration)
 #define TOKEN_MARGIN_S      300     // login again after 5 min before token expires
+
+// Command path (RTDB -> master)
+#define CMD_TASK_TICK_MS        500       // ms; cloudTask wake-up when no upload is pending
+#define CMD_POLL_INTERVAL       5000      // ms; poll "waiting" commands of every saved slave
+#define CMD_STALE_MS            300000    // 5 min; older waiting command -> failed(stale), same as dashboard
+#define CMD_BOOT_GRACE_MS       60000     // wait for slaves to re-register after master boot
+#define CMD_TABLE_MAX           8         // in-flight or not-yet-synced commands
+#define CMD_STATUS_RETRY_MS     5000      // retry gap of a failed status update
+#define CMD_STATUS_MAX_AGE_MS   600000    // 10 min; an unsynced status update is dropped
+#define CMD_INFLIGHT_MAX_MS     600000    // 10 min; no report from slave -> failed(slave_timeout)
+#define CMD_FLUSH_PER_STEP      2         // status updates sent per cloudTask step
+#define CMD_KEY_LEN             24        // push-key (20 chars) + '\0'
+#define DUMMY_COMMAND_FLOW                // comment out when slave firmware (stage 3) exists
+#define DUMMY_SENT_MS           2000      // dummy: transferring -> sent
+#define DUMMY_DONE_MS           3000      // dummy: sent -> done
 
 // Communication between slave
 #define MIST_TEMP_MAX_AGE   3            // cycles; relayed misting temperature stays valid this long
@@ -276,6 +292,50 @@ static unsigned long cloudTokenAt = 0;
 static unsigned long cloudTokenTtlMs = 0;
 static unsigned long cloudLastFail = 0;
 static unsigned long cloudRetryDelay = 0;  // 0 = currently not waiting
+
+// cmdType. Same values will be used in master_command.cmdType (stage 3).
+#define CMD_TIMED_INSTANT   1
+#define CMD_INSTANT_CHANGE  2
+#define CMD_DEACTIVATION    3
+// attribute values
+#define CMD_ACT_PUMP        1
+#define CMD_RES_WATER       0
+#define CMD_RES_FERT        1
+// cmdStatus. Order is monotonic: a status can only move to a higher value.
+#define CMD_ST_WAITING      0
+#define CMD_ST_TRANSFERRING 1
+#define CMD_ST_SENT         2
+#define CMD_ST_DONE         3
+#define CMD_ST_FAILED       4
+// failReason
+#define CMD_RS_NONE                 0
+#define CMD_RS_STALE                1
+#define CMD_RS_MASTER_RESTART       2
+#define CMD_RS_SLAVE_NOT_REGISTERED 3
+#define CMD_RS_UNSUPPORTED_TYPE     4
+#define CMD_RS_SLAVE_TIMEOUT        5
+
+static const char *const CMD_STATUS_STR[] = {"waiting", "transferring", "sent", "done", "failed"};
+static const char *const CMD_REASON_STR[] = {"", "stale", "master_restart", "slave_not_registered",
+                                             "unsupported_type", "slave_timeout"};
+
+struct CmdEntry {
+  bool          used;
+  char          key[CMD_KEY_LEN];  // RTDB push-key
+  uint8_t       slaveNum;          // numeric ID of "slaveN"
+  uint8_t       cmdID;             // 1..255, ID in the ESP-NOW packet (stage 3)
+  uint8_t       cmdType;
+  uint8_t       attr;              // CMD_ACT_* or CMD_RES_* (stage 3)
+  uint8_t       status;            // latest status known by the master
+  uint8_t       synced;            // latest status confirmed in RTDB
+  uint8_t       reason;
+  unsigned long changedMs;         // millis() when status changed
+  unsigned long lastTryMs;         // millis() of the last RTDB update attempt
+};
+
+static CmdEntry cmdTable[CMD_TABLE_MAX];
+static SemaphoreHandle_t cmdMutex = NULL;   // table is shared: cloudTask <-> loop (stage 3)
+static uint8_t cmdNextID = 0;
 
 // history upload: loop() -> cloudTask (body) and cloudTask -> loop() (result)
 struct HistUpload {
@@ -1343,40 +1403,47 @@ bool cloudSignIn() {
 // PATCH <path>.json. true on HTTP 200/204. httpCode (optional) receives the HTTP status (0 = never sent).
 // resetAuthOn401 = true  : /latest. A 401 clears the token and starts the sign-in backoff.
 // resetAuthOn401 = false : /history. A 401 can be a rules rejection, so it must not disturb the token or block /latest.
-bool cloudPatch(const char *path, const char *payload, bool resetAuthOn401, int *httpCode) {
-  if (httpCode) *httpCode = 0;
+// Generic RTDB REST call. pathQuery starts with "/", e.g. "/latest.json?print=silent".
+// Returns the HTTP code, or a negative number on a transport/auth problem.
+// 401 handling is the same as before: drop the token and back off.
+int cloudHttp(const char *method, const String &pathQuery, const char *body, String *resp) {
   bool tokenOk = cloudToken.length() > 0 && (millis() - cloudTokenAt) < cloudTokenTtlMs;
-  if (!tokenOk && !cloudSignIn()) return false;
+  if (!tokenOk && !cloudSignIn()) return -1000;
 
   HTTPClient http;
   http.setConnectTimeout(CLOUD_HTTP_TIMEOUT);
   http.setTimeout(CLOUD_HTTP_TIMEOUT);
 
-  String url = cloudCfg.dbUrl + path + ".json?print=silent&auth=" + cloudToken;
+  String url = cloudCfg.dbUrl + pathQuery + (pathQuery.indexOf('?') >= 0 ? "&auth=" : "?auth=") + cloudToken;
   if (!http.begin(dbClient, url)) {
     dbClient.stop();
-    return false;
+    return -1001;
   }
   http.addHeader("Content-Type", "application/json");
 
-  int code = http.PATCH((uint8_t *)payload, strlen(payload));
-  if (httpCode) *httpCode = code;
-  if (code == 200 || code == 204) {
-    http.end();
-    Serial.printf("Cloud: PATCH %s succeeded\n", path);
-    return true;
-  }
-
-  String err = (code > 0) ? http.getString() : String();
+  int code = http.sendRequest(method, (uint8_t *)body, body ? strlen(body) : 0);
+  if (resp && code > 0) *resp = http.getString();
   http.end();
-  Serial.printf("Cloud: PATCH %s failed (HTTP %d) %s\n", path, code, err.c_str());
 
-  if (code < 0) dbClient.stop();   // koneksi rusak -> dibuka ulang di request berikut
-  if (code == 401 && resetAuthOn401) {
+  if (code < 0) dbClient.stop();   // broken connection -> reopened on the next request
+  if (code == 401) {
+    // 401 may mean expired token OR denied by rules; do not sign in every cycle
     cloudToken = "";
     cloudLastFail = millis();
     cloudRetryDelay = SIGNIN_RETRY_MS;
   }
+  return code;
+}
+
+// PATCH /latest.json. true if succeeded.
+bool cloudPatchLatest(const char *payload) {
+  String err;
+  int code = cloudHttp("PATCH", "/latest.json?print=silent", payload, &err);
+  if (code == 200 || code == 204) {
+    Serial.println("Cloud: PATCH latest succeeded");
+    return true;
+  }
+  Serial.printf("Cloud: PATCH latest failed (HTTP %d) %s\n", code, err.c_str());
   return false;
 }
 
@@ -1385,10 +1452,10 @@ void cloudTask(void *) {
   bool reported = false;
 
   for (;;) {
-    // 1. latest: overwrite semantics, may be dropped
+    // wait briefly for an aggregate to upload, then give the command path a turn
     char *payload = nullptr;
-    if (xQueueReceive(cloudQueue, &payload, pdMS_TO_TICKS(200)) == pdTRUE && payload != nullptr) {
-      if (wifiFlag == WifiState::CONNECTED && cloudPatch("/latest", payload, true, nullptr) && !reported) {
+    if (xQueueReceive(cloudQueue, &payload, pdMS_TO_TICKS(CMD_TASK_TICK_MS)) == pdTRUE && payload != nullptr) {
+      if (wifiFlag == WifiState::CONNECTED && cloudPatchLatest(payload) && !reported) {
         reported = true;
         Serial.printf("Cloud: first upload OK. Task stack free: %u bytes\n",
                       (unsigned)uxTaskGetStackHighWaterMark(NULL));
@@ -1396,20 +1463,330 @@ void cloudTask(void *) {
       free(payload);
     }
 
-    // 2. history: never dropped here, the result goes back to loop()
-    HistUpload u;
-    if (historyQueue != NULL && xQueueReceive(historyQueue, &u, 0) == pdTRUE) {
-      HistAck ack = {u.slaveID, u.lastBucket, false, false};
-      if (wifiFlag == WifiState::CONNECTED) {
-        char path[24];
-        snprintf(path, sizeof(path), "/history/slave%u", (unsigned)u.slaveID);
-        int code = 0;
-        ack.ok = cloudPatch(path, u.body, false, &code);
-        ack.counts = (code >= 400 && code < 500);
-      }
-      free(u.body);
-      xQueueSend(historyAckQueue, &ack, 0);
+    cloudCommandStep();
+  }
+}
+
+// =====================================================
+// COMMANDS (RTDB -> master). Everything here runs in cloudTask,
+// except reportCommandStatus() which stage 3 calls from loop().
+// =====================================================
+
+// Stage 3 calls this for sent / done / failed. A status only moves forward.
+bool reportCommandStatus(uint8_t slaveNum, uint8_t cmdID, uint8_t status, uint8_t reason = CMD_RS_NONE) {
+  if (cmdMutex == NULL) return false;
+  bool ok = false;
+  xSemaphoreTake(cmdMutex, portMAX_DELAY);
+  for (auto &e : cmdTable) {
+    if (!e.used || e.cmdID != cmdID || e.slaveNum != slaveNum) continue;
+    if (e.status < CMD_ST_DONE && status > e.status) {
+      e.status = status;
+      e.reason = reason;
+      e.changedMs = millis();
+      e.lastTryMs = millis() - CMD_STATUS_RETRY_MS;   // due immediately
+      ok = true;
     }
+    break;
+  }
+  xSemaphoreGive(cmdMutex);
+  return ok;
+}
+
+// mutex must be held
+static void cmdApply(CmdEntry &e, uint8_t status, uint8_t reason) {
+  e.status = status;
+  e.reason = reason;
+  e.changedMs = millis();
+  e.lastTryMs = millis() - CMD_STATUS_RETRY_MS;
+}
+
+// mutex must be held. 0 = none free.
+static uint8_t cmdAllocID() {
+  for (int n = 0; n < 255; n++) {
+    cmdNextID = (cmdNextID % 255) + 1;   // 1..255
+    bool inUse = false;
+    for (const auto &e : cmdTable) {
+      if (e.used && e.cmdID == cmdNextID) { inUse = true; break; }
+    }
+    if (!inUse) return cmdNextID;
+  }
+  return 0;
+}
+
+static bool registeredSlaveType(uint8_t num, String &type) {
+  for (const auto &s : slaves) {
+    if (s.slaveID == num) { type = s.slaveType; return true; }
+  }
+  return false;
+}
+
+// PATCH /commands/slaveN/<key>: cmdStatus (+ failReason when failed)
+static bool cloudPatchStatus(uint8_t slaveNum, const char *key, uint8_t status, uint8_t reason) {
+  char path[96];
+  snprintf(path, sizeof(path), "/commands/slave%u/%s.json?print=silent", slaveNum, key);
+
+  char body[96];
+  if (status == CMD_ST_FAILED && reason != CMD_RS_NONE) {
+    snprintf(body, sizeof(body), "{\"cmdStatus\":\"%s\",\"failReason\":\"%s\"}",
+             CMD_STATUS_STR[status], CMD_REASON_STR[reason]);
+  } else {
+    snprintf(body, sizeof(body), "{\"cmdStatus\":\"%s\"}", CMD_STATUS_STR[status]);
+  }
+
+  String err;
+  int code = cloudHttp("PATCH", path, body, &err);
+  if (code == 200 || code == 204) return true;
+  Serial.printf("Cloud: command %s status update failed (HTTP %d) %s\n", key, code, err.c_str());
+  return false;
+}
+
+// Decide what happens to one "waiting" command and put it in the table.
+// Called for every command returned by the poll; already-known keys are ignored.
+static void cmdIntake(uint8_t slaveNum, const char *key, JsonObject c) {
+  if (strlen(key) >= CMD_KEY_LEN) return;
+
+  // 1. parse and validate (before taking the mutex)
+  uint8_t type = 0, attr = 0;
+  bool valid = true;
+  const char *typeStr = c["cmdType"] | "";
+  if (strcmp(typeStr, "timed_instant") == 0) {
+    type = CMD_TIMED_INSTANT;
+    attr = CMD_ACT_PUMP;
+    valid = strcmp(c["actuator"] | "", "pump") == 0;
+  } else if (strcmp(typeStr, "instant_change") == 0) {
+    type = CMD_INSTANT_CHANGE;
+    const char *r = c["reservoir"] | "";
+    if (strcmp(r, "water") == 0) attr = CMD_RES_WATER;
+    else if (strcmp(r, "fert") == 0) attr = CMD_RES_FERT;
+    else valid = false;
+  } else if (strcmp(typeStr, "deactivation") == 0) {
+    type = CMD_DEACTIVATION;
+  } else {
+    valid = false;
+  }
+
+  String slaveType;
+  bool registered = registeredSlaveType(slaveNum, slaveType);
+  int64_t createdAt = c["createdAt"].as<int64_t>();            // ms epoch (server)
+  int64_t nowMs = (int64_t)time(nullptr) * 1000;
+
+  uint8_t status = CMD_ST_TRANSFERRING, reason = CMD_RS_NONE;
+  if (!valid || (type == CMD_INSTANT_CHANGE && registered && !slaveType.equalsIgnoreCase("irrigation"))) {
+    status = CMD_ST_FAILED;
+    reason = CMD_RS_UNSUPPORTED_TYPE;
+  } else if (createdAt <= 0 || nowMs - createdAt > CMD_STALE_MS) {
+    status = CMD_ST_FAILED;
+    reason = CMD_RS_STALE;
+  } else if (!registered) {
+    if (millis() < CMD_BOOT_GRACE_MS) return;   // slave may still re-register; stay waiting
+    status = CMD_ST_FAILED;
+    reason = CMD_RS_SLAVE_NOT_REGISTERED;
+  }
+
+  // 2. insert into the table
+  xSemaphoreTake(cmdMutex, portMAX_DELAY);
+
+  CmdEntry *slot = nullptr;
+  bool known = false;
+  for (auto &e : cmdTable) {
+    if (e.used && strcmp(e.key, key) == 0) { known = true; break; }
+    if (!e.used && slot == nullptr) slot = &e;
+  }
+
+  if (!known) {
+    if (slot == nullptr) {
+      Serial.printf("Command table full. %s stays waiting.\n", key);
+    } else {
+      uint8_t id = (status == CMD_ST_FAILED) ? 0 : cmdAllocID();
+      *slot = CmdEntry{};
+      slot->used = true;
+      strncpy(slot->key, key, CMD_KEY_LEN - 1);
+      slot->slaveNum = slaveNum;
+      slot->cmdID = id;
+      slot->cmdType = type;
+      slot->attr = attr;
+      slot->synced = CMD_ST_WAITING;     // what RTDB holds right now
+      cmdApply(*slot, status, reason);
+      Serial.printf("Command %s (slave%u, type %u): %s%s%s\n", key, slaveNum, type,
+                    CMD_STATUS_STR[status], reason ? " / " : "", CMD_REASON_STR[reason]);
+    }
+  }
+
+  xSemaphoreGive(cmdMutex);
+}
+
+static int cmpKey(const void *a, const void *b) {
+  return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+// One GET per saved slave: waiting commands, oldest first.
+static void cloudPollWaiting() {
+  size_t n = savedSlaves.size();   // elements below n are stable (vector has reserved capacity)
+  for (size_t i = 0; i < n; i++) {
+    if (wifiFlag != WifiState::CONNECTED) return;
+    uint8_t slaveNum = savedSlaves[i].slaveID;
+
+    char path[120];
+    snprintf(path, sizeof(path),
+             "/commands/slave%u.json?orderBy=%%22cmdStatus%%22&equalTo=%%22waiting%%22&limitToFirst=5",
+             slaveNum);
+
+    String resp;
+    int code = cloudHttp("GET", path, nullptr, &resp);
+    if (code != 200) {
+      Serial.printf("Cloud: poll slave%u failed (HTTP %d)\n", slaveNum, code);
+      continue;
+    }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, resp) || !doc.is<JsonObject>()) continue;   // "null" = nothing waiting
+
+    // push-keys sort chronologically; do not rely on JSON member order
+    const char *keys[5];
+    size_t k = 0;
+    for (JsonPair kv : doc.as<JsonObject>()) {
+      if (k < 5) keys[k++] = kv.key().c_str();
+    }
+    qsort(keys, k, sizeof(keys[0]), cmpKey);
+    for (size_t j = 0; j < k; j++) {
+      cmdIntake(slaveNum, keys[j], doc[keys[j]].as<JsonObject>());
+    }
+  }
+}
+
+// Once per boot: commands left transferring/sent in RTDB have no owner anymore.
+// Returns true when finished (so waiting commands may be fetched); false -> try again later.
+static bool cloudCleanupOrphans() {
+  String resp;
+  if (cloudHttp("GET", "/commands.json?shallow=true", nullptr, &resp) != 200) return false;
+
+  JsonDocument slavesDoc;
+  if (deserializeJson(slavesDoc, resp)) return false;
+  if (!slavesDoc.is<JsonObject>()) return true;   // no commands at all
+
+  static const char *const orphanStates[] = {"transferring", "sent"};
+  for (JsonPair sp : slavesDoc.as<JsonObject>()) {
+    const char *slaveKey = sp.key().c_str();
+    if (strncmp(slaveKey, "slave", 5) != 0) continue;
+    uint8_t slaveNum = (uint8_t)atoi(slaveKey + 5);
+    if (slaveNum == 0) continue;
+
+    for (const char *st : orphanStates) {
+      String path = String("/commands/") + slaveKey +
+                    ".json?orderBy=%22cmdStatus%22&equalTo=%22" + st + "%22";
+      String r;
+      if (cloudHttp("GET", path, nullptr, &r) != 200) return false;
+
+      JsonDocument d;
+      if (deserializeJson(d, r) || !d.is<JsonObject>()) continue;
+      for (JsonPair cp : d.as<JsonObject>()) {
+        if (!cloudPatchStatus(slaveNum, cp.key().c_str(), CMD_ST_FAILED, CMD_RS_MASTER_RESTART)) return false;
+        Serial.printf("Orphan command %s (slave%u, was %s) -> failed / master_restart\n",
+                      cp.key().c_str(), slaveNum, st);
+      }
+    }
+  }
+  return true;
+}
+
+// Push status differences to RTDB; free finished entries; drop updates that never got through.
+static void cmdFlushStatus() {
+  int attempts = 0;
+  for (int i = 0; i < CMD_TABLE_MAX && attempts < CMD_FLUSH_PER_STEP; i++) {
+    CmdEntry snap = {};
+    bool need = false;
+
+    xSemaphoreTake(cmdMutex, portMAX_DELAY);
+    CmdEntry &e = cmdTable[i];
+    if (e.used) {
+      unsigned long now = millis();
+      if (e.status == e.synced) {
+        if (e.status >= CMD_ST_DONE) e.used = false;   // terminal and already in RTDB
+      } else if (now - e.changedMs > CMD_STATUS_MAX_AGE_MS) {
+        Serial.printf("Command %s: status update dropped (timeout).\n", e.key);
+        e.used = false;
+      } else if (now - e.lastTryMs >= CMD_STATUS_RETRY_MS) {
+        e.lastTryMs = now;
+        snap = e;
+        need = true;
+      }
+    }
+    xSemaphoreGive(cmdMutex);
+    if (!need) continue;
+
+    attempts++;
+    if (!cloudPatchStatus(snap.slaveNum, snap.key, snap.status, snap.reason)) continue;
+
+    xSemaphoreTake(cmdMutex, portMAX_DELAY);
+    CmdEntry &c = cmdTable[i];
+    if (c.used && c.cmdID == snap.cmdID && strcmp(c.key, snap.key) == 0) {
+      c.synced = snap.status;   // if status moved on meanwhile, the next flush sends the newer one
+      if (c.status == c.synced && c.status >= CMD_ST_DONE) c.used = false;
+    }
+    xSemaphoreGive(cmdMutex);
+    Serial.printf("Command %s -> %s\n", snap.key, CMD_STATUS_STR[snap.status]);
+  }
+}
+
+// A command that never gets a report from the slave must not occupy the table forever.
+static void cmdExpireInflight() {
+  xSemaphoreTake(cmdMutex, portMAX_DELAY);
+  unsigned long now = millis();
+  for (auto &e : cmdTable) {
+    if (e.used && e.status < CMD_ST_DONE && e.status == e.synced &&
+        now - e.changedMs > CMD_INFLIGHT_MAX_MS) {
+      Serial.printf("Command %s: no report from slave. -> failed / slave_timeout\n", e.key);
+      cmdApply(e, CMD_ST_FAILED, CMD_RS_SLAVE_TIMEOUT);
+    }
+  }
+  xSemaphoreGive(cmdMutex);
+}
+
+#ifdef DUMMY_COMMAND_FLOW
+// Stand-in for stage 3: pretend the slave received and executed the command.
+static void cmdDummyTick() {
+  xSemaphoreTake(cmdMutex, portMAX_DELAY);
+  unsigned long now = millis();
+  for (auto &e : cmdTable) {
+    if (!e.used || e.status != e.synced) continue;   // wait until the previous status is in RTDB
+    if (e.status == CMD_ST_TRANSFERRING && now - e.changedMs >= DUMMY_SENT_MS) cmdApply(e, CMD_ST_SENT, CMD_RS_NONE);
+    else if (e.status == CMD_ST_SENT && now - e.changedMs >= DUMMY_DONE_MS) cmdApply(e, CMD_ST_DONE, CMD_RS_NONE);
+  }
+  xSemaphoreGive(cmdMutex);
+}
+#endif
+
+// One step of the command path; called every cloudTask iteration.
+static void cloudCommandStep() {
+  if (wifiFlag != WifiState::CONNECTED) return;
+
+  static unsigned long lastPoll = 0;
+  static bool cleaned = false;
+  static bool stackLogged = false;
+
+  cmdExpireInflight();
+#ifdef DUMMY_COMMAND_FLOW
+  cmdDummyTick();
+#endif
+  cmdFlushStatus();
+
+  // Age checks need a valid clock. Without it nothing is fetched (commands stay waiting).
+  if (!isTimeValid()) return;
+  if (millis() - lastPoll < CMD_POLL_INTERVAL) return;
+  lastPoll = millis();
+
+  if (!cleaned) {
+    cleaned = cloudCleanupOrphans();
+    if (!cleaned) return;
+    Serial.println("Cloud: orphan command cleanup done.");
+  }
+
+  cloudPollWaiting();
+
+  if (!stackLogged) {
+    stackLogged = true;
+    Serial.printf("Cloud: first command poll done. Task stack free: %u bytes\n",
+                  (unsigned)uxTaskGetStackHighWaterMark(NULL));
   }
 }
 
@@ -1902,39 +2279,11 @@ void setup() {
   Serial.println("ESP-NOW initialized.");
   Serial.println("Receive callback registered.");
 
-  /*
-     Add broadcast peer.
-     Not needed to receive broadcast,
-     But needed to send broadcast.
-     Currently unneeded, but who knows what the future holds
-  */
-
-  // uint8_t broadcastAddress[] = {
-  //   0xFF, 0xFF, 0xFF,
-  //   0xFF, 0xFF, 0xFF
-  // };
-
-  // esp_now_peer_info_t broadcastPeer = {};
-
-  // memcpy(
-  //   broadcastPeer.peer_addr,
-  //   broadcastAddress,
-  //   6
-  // );
-
-  // broadcastPeer.channel = active_channel;
-  // broadcastPeer.ifidx = WIFI_IF_STA;
-  // broadcastPeer.encrypt = false;
-
-  // result = esp_now_add_peer(&broadcastPeer);
-
-  // if (result != ESP_OK &&
-  //     result != ESP_ERR_ESPNOW_EXIST) {
-  //   Serial.printf(
-  //     "Failed to add broadcast peer: %s\n",
-  //     esp_err_to_name(result)
-  //   );
-  // }
+  cmdMutex = xSemaphoreCreateMutex();
+  if (cmdMutex == NULL) {
+    Serial.println("Failed to create command mutex.");
+    while (true) delay(1000);
+  }
 
   if (cloudCfg.valid) {
     cloudQueue      = xQueueCreate(1, sizeof(char *));
