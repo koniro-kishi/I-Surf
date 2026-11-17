@@ -62,9 +62,12 @@
 #define CMD_INFLIGHT_MAX_MS     600000    // 10 min; no report from slave -> failed(slave_timeout)
 #define CMD_FLUSH_PER_STEP      2         // status updates sent per cloudTask step
 #define CMD_KEY_LEN             24        // push-key (20 chars) + '\0'
-#define DUMMY_COMMAND_FLOW                // comment out when slave firmware (stage 3) exists
-#define DUMMY_SENT_MS           2000      // dummy: transferring -> sent
-#define DUMMY_DONE_MS           3000      // dummy: sent -> done
+// #define DUMMY_COMMAND_FLOW                // OFF: real slaves now report sent/done
+// #define DUMMY_SENT_MS           2000      // dummy: transferring -> sent
+// #define DUMMY_DONE_MS           3000      // dummy: sent -> done
+#define CMD_ACK_TIMEOUT_MS      1500      // ms; resend gap when no ack
+#define CMD_SEND_MAX            3         // total sends (1 + 2 retries), then failed(slave_no_ack)
+#define CMD_REPLY_QUEUE_DEPTH   10
 
 // Communication between slave
 #define MIST_TEMP_MAX_AGE   3            // cycles; relayed misting temperature stays valid this long
@@ -94,10 +97,51 @@ static_assert(HIST_BUCKET_MIN >= 1 && HIST_BUCKET_MIN <= 10,
    MESSAGE TYPES AND SIZE
    ===================================================== */
 
-#define MSG_SEARCH_MASTER   0
-#define MSG_MASTER_CONFIRM  1
-#define MSG_MASTER_REQUEST  2
-#define MSG_SLAVE_READING   3
+#define MSG_SEARCH_MASTER       0
+#define MSG_MASTER_CONFIRM      1
+#define MSG_MASTER_REQUEST      2
+#define MSG_SLAVE_READING       3
+#define MSG_MASTER_COMMAND      4
+#define MSG_SLAVE_COMMAND_ACK   5
+#define MSG_SLAVE_COMMAND_STAT  6
+
+#define COMMAND_BUFFER_SIZE     64
+
+// cmdType
+#define CMD_TIMED_INSTANT   1
+#define CMD_INSTANT_CHANGE  2
+#define CMD_DEACTIVATION    3
+// cmdStatus (dipakai di slave_command_stat)
+#define CMD_ST_DONE         3
+#define CMD_ST_FAILED       4
+
+// attribute values
+#define CMD_ACT_PUMP        1
+#define CMD_RES_WATER       0
+#define CMD_RES_FERT        1
+// cmdStatus. Order is monotonic: a status can only move to a higher value.
+#define CMD_ST_WAITING      0
+#define CMD_ST_TRANSFERRING 1
+#define CMD_ST_SENT         2
+#define CMD_ST_DONE         3
+#define CMD_ST_FAILED       4
+
+static const char *const CMD_STATUS_STR[] = {"waiting", "transferring", "sent", "done", "failed"};
+
+// failReason
+#define CMD_RS_NONE                 0
+#define CMD_RS_STALE                1
+#define CMD_RS_MASTER_RESTART       2
+#define CMD_RS_SLAVE_NOT_REGISTERED 3
+#define CMD_RS_UNSUPPORTED_TYPE     4
+#define CMD_RS_SLAVE_TIMEOUT        5
+#define CMD_RS_SLAVE_NO_ACK         6
+#define CMD_RS_SLAVE_REJECTED       7
+#define CMD_RS_SLAVE_INTERRUPTED    8
+
+static const char *const CMD_REASON_STR[] = {"", "stale", "master_restart", "slave_not_registered",
+                                             "unsupported_type", "slave_timeout",
+                                             "slave_no_ack", "slave_rejected", "slave_interrupted"};
 
 #define READING_PACKET_MAX  250   // batas payload ESP-NOW
 #define READING_HEADER_SIZE 24    // srcAddr(6)+msgType(1)+slaveID(1)+slaveType(16)
@@ -148,6 +192,39 @@ typedef struct __attribute__((packed)) {
 static_assert(offsetof(slave_reading, reportBuffer) == READING_HEADER_SIZE, "header size mismatch");
 static_assert(sizeof(slave_reading) == READING_PACKET_MAX, "slave_reading must be 250 bytes");
 
+// 4. Master sends a command to a slave
+typedef struct __attribute__((packed)) {
+  uint8_t srcAddr[6];
+  uint8_t msgType;
+  uint8_t dstAddr[6];
+  uint8_t slaveID;
+  uint8_t cmdID;
+  uint8_t cmdType;
+  char commandBuffer[COMMAND_BUFFER_SIZE];   // serialized JSON, null-terminated
+} master_command;
+static_assert(sizeof(master_command) == 16 + COMMAND_BUFFER_SIZE, "master_command size mismatch");
+
+// 5. Slave confirms it received a command (commandBuffer empty)
+typedef struct __attribute__((packed)) {
+  uint8_t srcAddr[6];
+  uint8_t msgType;
+  uint8_t cmdID;
+  uint8_t cmdType;
+  char commandBuffer[COMMAND_BUFFER_SIZE];
+} slave_command_ack;
+static_assert(sizeof(slave_command_ack) == 9 + COMMAND_BUFFER_SIZE, "slave_command_ack size mismatch");
+
+// 6. Slave reports the outcome (commandBuffer: {} or {"reason":"rejected"|"interrupted"})
+typedef struct __attribute__((packed)) {
+  uint8_t srcAddr[6];
+  uint8_t msgType;
+  uint8_t cmdID;
+  uint8_t cmdType;
+  char commandBuffer[COMMAND_BUFFER_SIZE];
+  uint8_t cmdStatus;                         // CMD_ST_DONE or CMD_ST_FAILED
+} slave_command_stat;
+static_assert(sizeof(slave_command_stat) == 10 + COMMAND_BUFFER_SIZE, "slave_command_stat size mismatch");
+
 #define READING_QUEUE_DEPTH 20
 
 // reading queue
@@ -156,6 +233,14 @@ struct RxReading {
   uint16_t len;
   slave_reading pkt;
 };
+
+// ack / stat packets from slaves, copied in the ESP-NOW callback, handled in loop()
+struct RxCmdReply {
+  uint8_t srcAddr[6];
+  uint8_t len;
+  uint8_t data[sizeof(slave_command_stat)];
+};
+QueueHandle_t cmdReplyQueue = NULL;
 
 // database login
 struct CloudConfig {
@@ -192,6 +277,22 @@ typedef struct {
   uint16_t    head;                    // next write index
   uint16_t    count;                   // valid records
 } HistSlave;
+
+typedef struct {
+  bool          used;
+  char          key[CMD_KEY_LEN];  // RTDB push-key
+  uint8_t       slaveNum;          // numeric ID of "slaveN"
+  uint8_t       cmdID;             // 1..255, ID in the ESP-NOW packet (stage 3)
+  uint8_t       cmdType;
+  uint8_t       attr;              // CMD_ACT_* or CMD_RES_* (stage 3)
+  uint8_t       status;            // latest status known by the master
+  uint8_t       synced;            // latest status confirmed in RTDB
+  uint8_t       reason;
+  unsigned long changedMs;         // millis() when status changed
+  unsigned long lastTryMs;         // millis() of the last RTDB update attempt
+  uint8_t       tries;             // times the command was sent to the slave
+  unsigned long lastSendMs;
+} CmdEntry;
 
 /* =====================================================
    SLAVE INFORMATION
@@ -292,46 +393,6 @@ static unsigned long cloudTokenAt = 0;
 static unsigned long cloudTokenTtlMs = 0;
 static unsigned long cloudLastFail = 0;
 static unsigned long cloudRetryDelay = 0;  // 0 = currently not waiting
-
-// cmdType. Same values will be used in master_command.cmdType (stage 3).
-#define CMD_TIMED_INSTANT   1
-#define CMD_INSTANT_CHANGE  2
-#define CMD_DEACTIVATION    3
-// attribute values
-#define CMD_ACT_PUMP        1
-#define CMD_RES_WATER       0
-#define CMD_RES_FERT        1
-// cmdStatus. Order is monotonic: a status can only move to a higher value.
-#define CMD_ST_WAITING      0
-#define CMD_ST_TRANSFERRING 1
-#define CMD_ST_SENT         2
-#define CMD_ST_DONE         3
-#define CMD_ST_FAILED       4
-// failReason
-#define CMD_RS_NONE                 0
-#define CMD_RS_STALE                1
-#define CMD_RS_MASTER_RESTART       2
-#define CMD_RS_SLAVE_NOT_REGISTERED 3
-#define CMD_RS_UNSUPPORTED_TYPE     4
-#define CMD_RS_SLAVE_TIMEOUT        5
-
-static const char *const CMD_STATUS_STR[] = {"waiting", "transferring", "sent", "done", "failed"};
-static const char *const CMD_REASON_STR[] = {"", "stale", "master_restart", "slave_not_registered",
-                                             "unsupported_type", "slave_timeout"};
-
-struct CmdEntry {
-  bool          used;
-  char          key[CMD_KEY_LEN];  // RTDB push-key
-  uint8_t       slaveNum;          // numeric ID of "slaveN"
-  uint8_t       cmdID;             // 1..255, ID in the ESP-NOW packet (stage 3)
-  uint8_t       cmdType;
-  uint8_t       attr;              // CMD_ACT_* or CMD_RES_* (stage 3)
-  uint8_t       status;            // latest status known by the master
-  uint8_t       synced;            // latest status confirmed in RTDB
-  uint8_t       reason;
-  unsigned long changedMs;         // millis() when status changed
-  unsigned long lastTryMs;         // millis() of the last RTDB update attempt
-};
 
 static CmdEntry cmdTable[CMD_TABLE_MAX];
 static SemaphoreHandle_t cmdMutex = NULL;   // table is shared: cloudTask <-> loop (stage 3)
@@ -571,6 +632,20 @@ void enqueueReading(const uint8_t *srcAddr, const uint8_t *data, int len) {
 
   if (xQueueSend(readingQueue, &item, 0) != pdTRUE) {
     Serial.println("Reading queue full. Packet dropped.");
+  }
+}
+
+void enqueueCmdReply(const uint8_t *srcAddr, const uint8_t *data, int len) {
+  if (len <= 7 || len > (int)sizeof(slave_command_stat)) {
+    Serial.println("Invalid command reply size.");
+    return;
+  }
+  RxCmdReply item = {};
+  memcpy(item.srcAddr, srcAddr, 6);
+  item.len = (uint8_t)len;
+  memcpy(item.data, data, len);
+  if (xQueueSend(cmdReplyQueue, &item, 0) != pdTRUE) {
+    Serial.println("Command reply queue full. Packet dropped.");
   }
 }
 
@@ -1291,6 +1366,11 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
       enqueueReading(info->src_addr, incomingData, len);
       break;
 
+    case MSG_SLAVE_COMMAND_ACK:
+    case MSG_SLAVE_COMMAND_STAT:
+      enqueueCmdReply(info->src_addr, incomingData, len);
+      break;
+
     default:
       Serial.println("Unknown message type.");
       break;
@@ -1447,6 +1527,124 @@ bool cloudPatchLatest(const char *payload) {
   return false;
 }
 
+// ---- master -> slave forwarding (runs in loop()) ----
+
+static void sendCommandToSlave(const CmdEntry &c) {
+  const uint8_t *mac = nullptr;
+  for (const auto &s : slaves) {
+    if (s.slaveID == c.slaveNum) { mac = s.mac; break; }
+  }
+  if (mac == nullptr) {
+    reportCommandStatus(c.slaveNum, c.cmdID, CMD_ST_FAILED, CMD_RS_SLAVE_NOT_REGISTERED);
+    return;
+  }
+
+  master_command m = {};
+  WiFi.macAddress(m.srcAddr);
+  m.msgType = MSG_MASTER_COMMAND;
+  memcpy(m.dstAddr, mac, 6);
+  m.slaveID = c.slaveNum;
+  m.cmdID = c.cmdID;
+  m.cmdType = c.cmdType;
+
+  switch (c.cmdType) {
+    case CMD_TIMED_INSTANT:
+      snprintf(m.commandBuffer, sizeof(m.commandBuffer), "{\"actuator\":\"pump\"}");
+      break;
+    case CMD_INSTANT_CHANGE:
+      snprintf(m.commandBuffer, sizeof(m.commandBuffer), "{\"reservoir\":\"%s\"}",
+               c.attr == CMD_RES_FERT ? "fert" : "water");
+      break;
+    default:   // CMD_DEACTIVATION: no attributes
+      snprintf(m.commandBuffer, sizeof(m.commandBuffer), "{}");
+      break;
+  }
+
+  esp_err_t r = esp_now_send(mac, (uint8_t *)&m, sizeof(m));
+  Serial.printf("Command #%u (type %u) -> slave%u, try %u: %s\n",
+                c.cmdID, c.cmdType, c.slaveNum, c.tries, esp_err_to_name(r));
+}
+
+// Send (or resend) commands that were not acked yet; give up after CMD_SEND_MAX sends.
+void cmdForwardStep() {
+  for (int i = 0; i < CMD_TABLE_MAX; i++) {
+    CmdEntry snap = {};
+    bool send = false;
+    bool gaveUp = false;
+
+    xSemaphoreTake(cmdMutex, portMAX_DELAY);
+    CmdEntry &e = cmdTable[i];
+    if (e.used && e.status == CMD_ST_TRANSFERRING) {
+      unsigned long now = millis();
+      if (e.tries == 0 || now - e.lastSendMs >= CMD_ACK_TIMEOUT_MS) {
+        if (e.tries >= CMD_SEND_MAX) {
+          cmdApply(e, CMD_ST_FAILED, CMD_RS_SLAVE_NO_ACK);
+          snap = e;
+          gaveUp = true;
+        } else {
+          e.tries++;
+          e.lastSendMs = now;
+          snap = e;
+          send = true;
+        }
+      }
+    }
+    xSemaphoreGive(cmdMutex);
+
+    if (gaveUp) Serial.printf("Command #%u: no ack from slave%u -> failed / slave_no_ack\n", snap.cmdID, snap.slaveNum);
+    if (send) sendCommandToSlave(snap);
+  }
+}
+
+// ack -> sent; stat -> done / failed
+static void onCmdReply(const RxCmdReply &r) {
+  int slaveNum = findSlaveID(r.srcAddr);
+  if (slaveNum < 0) {
+    Serial.println("Command reply from unregistered MAC. Dropped.");
+    return;
+  }
+
+  if (r.data[6] == MSG_SLAVE_COMMAND_ACK) {
+    if (r.len != sizeof(slave_command_ack)) { Serial.println("Invalid slave_command_ack size."); return; }
+    slave_command_ack a;
+    memcpy(&a, r.data, sizeof(a));
+    if (reportCommandStatus((uint8_t)slaveNum, a.cmdID, CMD_ST_SENT, CMD_RS_NONE)) {
+      Serial.printf("Command #%u acked by slave%d\n", a.cmdID, slaveNum);
+    }
+  }
+  else if (r.data[6] == MSG_SLAVE_COMMAND_STAT) {
+    if (r.len != sizeof(slave_command_stat)) { Serial.println("Invalid slave_command_stat size."); return; }
+    slave_command_stat s;
+    memcpy(&s, r.data, sizeof(s));
+    s.commandBuffer[sizeof(s.commandBuffer) - 1] = '\0';   // do not trust the sender's terminator
+
+    uint8_t status = CMD_ST_DONE, reason = CMD_RS_NONE;
+    if (s.cmdStatus == CMD_ST_FAILED) {
+      JsonDocument d;
+      deserializeJson(d, s.commandBuffer);
+      status = CMD_ST_FAILED;
+      reason = (strcmp(d["reason"] | "", "interrupted") == 0) ? CMD_RS_SLAVE_INTERRUPTED
+                                                                : CMD_RS_SLAVE_REJECTED;
+    } else if (s.cmdStatus != CMD_ST_DONE) {
+      Serial.printf("Unknown cmdStatus %u from slave%d\n", s.cmdStatus, slaveNum);
+      return;
+    }
+    // a repeated stat is ignored by reportCommandStatus (status only moves forward);
+    // a stat without a preceding ack (lost ack) also works: it implies the ack
+    if (reportCommandStatus((uint8_t)slaveNum, s.cmdID, status, reason)) {
+      Serial.printf("Command #%u from slave%d: %s%s%s\n", s.cmdID, slaveNum, CMD_STATUS_STR[status],
+                    reason ? " / " : "", CMD_REASON_STR[reason]);
+    }
+  }
+}
+
+void processCmdReplyQueue() {
+  RxCmdReply item;
+  while (xQueueReceive(cmdReplyQueue, &item, 0) == pdTRUE) {
+    onCmdReply(item);
+  }
+}
+
 void cloudTask(void *) {
   dbClient.setInsecure();   // TIDAK memverifikasi sertifikat server (keputusan sementara)
   bool reported = false;
@@ -1473,7 +1671,7 @@ void cloudTask(void *) {
 // =====================================================
 
 // Stage 3 calls this for sent / done / failed. A status only moves forward.
-bool reportCommandStatus(uint8_t slaveNum, uint8_t cmdID, uint8_t status, uint8_t reason = CMD_RS_NONE) {
+bool reportCommandStatus(uint8_t slaveNum, uint8_t cmdID, uint8_t status, uint8_t reason) {
   if (cmdMutex == NULL) return false;
   bool ok = false;
   xSemaphoreTake(cmdMutex, portMAX_DELAY);
@@ -2258,6 +2456,12 @@ void setup() {
     while (true) delay(1000);
   }
 
+  cmdReplyQueue = xQueueCreate(CMD_REPLY_QUEUE_DEPTH, sizeof(RxCmdReply));
+  if (cmdReplyQueue == NULL) {
+    Serial.println("Failed to create command reply queue.");
+    while (true) delay(1000);
+  }
+
   // Registering callbacks
   result = esp_now_register_recv_cb(onDataRecv);
 
@@ -2309,6 +2513,8 @@ void setup() {
 
 void loop() {
   processReadingQueue();
+  processCmdReplyQueue();
+
   histMaintain();
   histUploadTick();
 
@@ -2401,6 +2607,7 @@ void loop() {
     }
   }
 
+  cmdForwardStep();
   handleWifiRetry();
 
   delay(10);

@@ -22,6 +22,8 @@ const float    HUM_MIN_GAP      = 5.0f;       // selisih minimal max - min
 const uint32_t AUTO_MAX_ON_MS   = 60000UL;    // 60 detik per siklus otomatis
 const uint32_t AUTO_REST_MS     = 120000UL;   // jeda minimal antar siklus otomatis
 const uint32_t MANUAL_MAX_ON_MS = 600000UL;   // 10 menit untuk manual
+const uint32_t ON_LIMIT_MIST_MS  = 120000UL;    // timed_instant run time (replaces MANUAL_MAX_ON_MS)
+const uint32_t OFF_TIME_MIST_MS  = 1800000UL;   // 30 min; deactivation hold on automatic activation
 
 // --- Komunikasi ESP-NOW (disamakan dengan slave irigasi) ---
 #define SLAVE_TYPE            "Misting"   // maks 15 karakter

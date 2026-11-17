@@ -74,6 +74,29 @@ static_assert(sizeof(NVS_SCHEDULE_NAMESPACE) - 1 <= 15, "NVS namespace max 15 ch
 #define MSG_MASTER_CONFIRM  1
 #define MSG_MASTER_REQUEST  2
 #define MSG_SLAVE_READING   3
+#define MSG_MASTER_COMMAND      4
+#define MSG_SLAVE_COMMAND_ACK   5
+#define MSG_SLAVE_COMMAND_STAT  6
+
+#define COMMAND_BUFFER_SIZE     64
+
+// cmdType
+#define CMD_TIMED_INSTANT   1
+#define CMD_INSTANT_CHANGE  2
+#define CMD_DEACTIVATION    3
+// cmdStatus (dipakai di slave_command_stat)
+#define CMD_ST_DONE         3
+#define CMD_ST_FAILED       4
+
+// Commands
+#define ON_LIMIT_IRR_MS      120000UL    // timed_instant run time
+#define OFF_TIME_IRR_MS      1800000UL   // 30 min; deactivation hold
+#define CMD_DEDUP_N          8
+#define CMD_DEDUP_WINDOW_MS  30000UL     // same cmdID within this window = retry, not a new command
+#define CMD_QUEUE_DEPTH      4
+#define STAT_REPEAT          3           // stat is sent blindly this many times
+#define STAT_GAP_MS          500
+#define STAT_JOBS            4
 
 // Logger: one line "<time> [TAG   ] message". Prototypes allow use anywhere in the sketch.
 void slog(const char *tag, const char *fmt, ...)  __attribute__((format(printf, 2, 3)));
@@ -128,35 +151,83 @@ typedef struct __attribute__((packed)) {
 static_assert(offsetof(slave_reading, reportBuffer) == READING_HEADER_SIZE, "header size mismatch");
 static_assert(sizeof(slave_reading) == READING_PACKET_MAX, "slave_reading must be 250 bytes");
 
+// 4. Master sends a command to a slave
+typedef struct __attribute__((packed)) {
+  uint8_t srcAddr[6];
+  uint8_t msgType;
+  uint8_t dstAddr[6];
+  uint8_t slaveID;
+  uint8_t cmdID;
+  uint8_t cmdType;
+  char commandBuffer[COMMAND_BUFFER_SIZE];   // serialized JSON, null-terminated
+} master_command;
+static_assert(sizeof(master_command) == 16 + COMMAND_BUFFER_SIZE, "master_command size mismatch");
+
+// 5. Slave confirms it received a command (commandBuffer empty)
+typedef struct __attribute__((packed)) {
+  uint8_t srcAddr[6];
+  uint8_t msgType;
+  uint8_t cmdID;
+  uint8_t cmdType;
+  char commandBuffer[COMMAND_BUFFER_SIZE];
+} slave_command_ack;
+static_assert(sizeof(slave_command_ack) == 9 + COMMAND_BUFFER_SIZE, "slave_command_ack size mismatch");
+
+// 6. Slave reports the outcome (commandBuffer: {} or {"reason":"rejected"|"interrupted"})
+typedef struct __attribute__((packed)) {
+  uint8_t srcAddr[6];
+  uint8_t msgType;
+  uint8_t cmdID;
+  uint8_t cmdType;
+  char commandBuffer[COMMAND_BUFFER_SIZE];
+  uint8_t cmdStatus;                         // CMD_ST_DONE or CMD_ST_FAILED
+} slave_command_stat;
+static_assert(sizeof(slave_command_stat) == 10 + COMMAND_BUFFER_SIZE, "slave_command_stat size mismatch");
+
+// command accepted by the receive callback, executed in loop()
+struct PendingCmd {
+  uint8_t cmdID;
+  uint8_t cmdType;
+  char    buffer[COMMAND_BUFFER_SIZE];
+};
+
+// outcome report that is still being (re)sent to the master
+struct StatJob {
+  bool          used;
+  uint8_t       cmdID, cmdType, status;
+  char          reason[16];
+  uint8_t       left;
+  unsigned long nextMs;
+};
+
 enum class Reservoir : uint8_t { WATER, FERT };
 
-const char *reservoirName(Reservoir r) { return r == Reservoir::FERT ? "FERT" : "WATER"; }
-
-struct SlaveState {
+typedef struct {
   float waterLevel;        // 0-1
   float fertLevel;         // 0-1
+  float fertTemp;          // C, NAN if the sensor failed
   float soilMoist;         // 0-1
   float soilPH;
   float fertPH;
   float fertTDS;           // ppm
   bool  isPumpOn;          // true if either pump relay is HIGH
   const char *useReservoir = "WATER";   // "WATER" or "FERT"; points to a string literal, safe to copy
-};
+} SlaveState;
 
 // Daily schedule. time in sec in day, 0..86400.
-struct schedule {
+typedef struct {
   uint32_t start;   // start time
   uint32_t stop;    // stop time (= start + duration), start < stop <= 86400
+} schedule;
+
+// Default schedules, same shape as every other schedule: start and stop in sec-in-day
+const schedule defaultSchedules[] = {
+  {HM(8, 0),  HM(8, 2)},
+  {HM(12, 0), HM(12, 2)},
+  {HM(16, 0), HM(16, 2)}
 };
 
-struct DefaultSchedule {
-  const char *key;          // "HH:MM"
-  uint32_t    durationSec;
-};
-
-const DefaultSchedule defaultSchedules[] = {
-  {"08:00", 120}, {"12:00", 120}, {"16:00", 120}
-};
+const char *reservoirName(Reservoir r) { return r == Reservoir::FERT ? "FERT" : "WATER"; }
 
 std::vector<schedule> schedules;   // sorted ascending on start
 
@@ -175,6 +246,14 @@ bool searchStepPending = false;         // true -> next searchMasterStep() runs 
 
 bool master_peer_added = false;
 volatile unsigned long lastRequestTime = 0;
+
+// Commands
+QueueHandle_t cmdQueue = NULL;
+StatJob statJobs[STAT_JOBS];
+bool          isExecutingInstant = false;   // pump on because of a timed_instant command
+uint8_t       instantCmdID = 0;
+bool          holdOn = false;               // deactivation hold (millis based, lost on reboot)
+unsigned long holdUntilMs = 0;
 
 // Sensor instance
 OneWire oneWire(pin_FertTemp);
@@ -538,7 +617,7 @@ void formatSecondOfDay(uint32_t sec, char *buf, size_t len) {
            (unsigned long)(sec / 3600), (unsigned long)((sec / 60) % 60), (unsigned long)(sec % 60));
 }
 
-// Seed 3 default schedule to NVS (key "HH:MM", stop value is in sec-in-day)
+// Seed the default schedules to NVS (key "HH:MM" of the start time, value = stop in sec-in-day)
 bool seedDefaultSchedules() {
   Preferences prefs;
   if (!prefs.begin(NVS_SCHEDULE_NAMESPACE, false)) return false;
@@ -558,6 +637,45 @@ bool seedDefaultSchedules() {
   }
   prefs.end();
   return ok;
+}
+
+// Read all NVS entry to 'out' (unsorted). Invalid entry is skipped and logged.
+// Return: number of raw entry in NVS (including the invalid(s) one); 0 = empty namespace.
+size_t readScheduleEntries(std::vector<schedule> &out) {
+  out.clear();
+
+  Preferences prefs;
+  if (!prefs.begin(NVS_SCHEDULE_NAMESPACE, false)) {
+    slogw("SCHED", "failed to open NVS namespace");
+    return 0;
+  }
+
+  size_t entries = 0;
+  nvs_iterator_t it = NULL;
+  esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, NVS_SCHEDULE_NAMESPACE, NVS_TYPE_U32, &it);
+
+  while (err == ESP_OK && it != NULL) {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+    entries++;
+
+    uint32_t startSec = 0;
+    uint32_t stopSec  = prefs.getUInt(info.key, 0);
+
+    if (!parseScheduleKey(info.key, startSec)) {
+      slogw("SCHED", "skip key '%s': invalid key", info.key);
+    } else if (stopSec <= startSec || stopSec > SECONDS_PER_DAY) {
+      slogw("SCHED", "skip key '%s': invalid stop %lu", info.key, (unsigned long)stopSec);
+    } else {
+      out.push_back({startSec, stopSec});
+    }
+
+    err = nvs_entry_next(&it);   // it = NULL if there is no more entry
+  }
+
+  if (it) nvs_release_iterator(it);
+  prefs.end();
+  return entries;
 }
 
 // ascending based on start, remove overlapping schedules, store to 'schedules'
@@ -656,6 +774,123 @@ void stopPump(const char *reason) {
   slog("PUMP", "OFF (%s)", reason);
 }
 
+bool holdActive() { return holdOn && (long)(millis() - holdUntilMs) < 0; }
+
+// Send one stat now, repeats are sent by maintainStat()
+void sendStat(uint8_t cmdID, uint8_t cmdType, uint8_t status, const char *reason) {
+  for (auto &j : statJobs) {
+    if (j.used) continue;
+    j = {};
+    j.used = true;
+    j.cmdID = cmdID; j.cmdType = cmdType; j.status = status;
+    if (reason) strncpy(j.reason, reason, sizeof(j.reason) - 1);
+    j.left = STAT_REPEAT;
+    j.nextMs = millis();
+    return;
+  }
+  slogw("CMD", "stat queue full, #%u report dropped", cmdID);
+}
+
+// Called in each loop() iteration
+void maintainStat() {
+  unsigned long now = millis();
+  for (auto &j : statJobs) {
+    if (!j.used || (long)(now - j.nextMs) < 0) continue;
+
+    slave_command_stat s = {};
+    WiFi.macAddress(s.srcAddr);
+    s.msgType = MSG_SLAVE_COMMAND_STAT;
+    s.cmdID = j.cmdID;
+    s.cmdType = j.cmdType;
+    if (j.reason[0]) snprintf(s.commandBuffer, sizeof(s.commandBuffer), "{\"reason\":\"%s\"}", j.reason);
+    s.cmdStatus = j.status;
+    sendToMaster((uint8_t *)&s, sizeof(s));
+
+    if (--j.left == 0) j.used = false;
+    else j.nextMs = now + STAT_GAP_MS;
+  }
+}
+
+// End of a timed_instant run: completed = ran the full ON_LIMIT
+void endInstant(bool completed, const char *reason) {
+  digitalWrite(pin_WaterPump, LOW);
+  digitalWrite(pin_FertPump, LOW);
+  isExecutingInstant = false;
+  slog("PUMP", "OFF (instant: %s)", reason);
+  if (instantCmdID != 0) {
+    sendStat(instantCmdID, CMD_TIMED_INSTANT, completed ? CMD_ST_DONE : CMD_ST_FAILED,
+             completed ? nullptr : "interrupted");
+    instantCmdID = 0;
+  }
+}
+
+void startInstantPump(uint8_t cmdID) {
+  digitalWrite(pin_WaterPump, LOW);   // exclusivity guard, same as startPump()
+  digitalWrite(pin_FertPump, LOW);
+  digitalWrite(pumpPin(todayReservoir), HIGH);
+  pumpStartMs = millis();
+  pumpRunMs = ON_LIMIT_IRR_MS;
+  isExecutingInstant = true;
+  instantCmdID = cmdID;
+  slog("PUMP", "%s ON for %lu s (instant #%u)", reservoirName(todayReservoir), ON_LIMIT_IRR_MS / 1000UL, cmdID);
+}
+
+void rejectCmd(const PendingCmd &c, const char *why) {
+  slogw("CMD", "#%u type %u rejected: %s", c.cmdID, c.cmdType, why);
+  sendStat(c.cmdID, c.cmdType, CMD_ST_FAILED, "rejected");
+}
+
+// Execute one accepted command. Runs in loop() only (never in the WiFi callback).
+void executeCommand(const PendingCmd &c) {
+  JsonDocument d;
+  deserializeJson(d, c.buffer);
+
+  switch (c.cmdType) {
+    case CMD_TIMED_INSTANT:
+      if (strcmp(d["actuator"] | "", "pump") != 0) { rejectCmd(c, "bad actuator"); break; }
+      if (isExecutingInstant) { rejectCmd(c, "instant run already active"); break; }
+      if (isExecutingSchedule) {
+        // instant takes over; the interrupted schedule counts as executed (curScheduleDone is already true)
+        isExecutingSchedule = false;
+        slog("PUMP", "schedule run taken over by instant command");
+      }
+      startInstantPump(c.cmdID);   // runs even during a hold; the hold keeps blocking schedules
+      break;
+
+    case CMD_DEACTIVATION:
+      holdOn = true;
+      holdUntilMs = millis() + OFF_TIME_IRR_MS;
+      slog("PUMP", "hold for %lu s (deactivation #%u)", OFF_TIME_IRR_MS / 1000UL, c.cmdID);
+      if (isExecutingInstant) endInstant(false, "deactivation");
+      if (isExecutingSchedule) {
+        stopPump("deactivation");
+        curScheduleDone = false;   // may resume after the hold if still inside its window
+      }
+      sendStat(c.cmdID, c.cmdType, CMD_ST_DONE, nullptr);   // done = applied now, not when the hold ends
+      break;
+
+    case CMD_INSTANT_CHANGE: {
+      const char *r = d["reservoir"] | "";
+      if (strcmp(r, "water") == 0) todayReservoir = Reservoir::WATER;
+      else if (strcmp(r, "fert") == 0) todayReservoir = Reservoir::FERT;
+      else { rejectCmd(c, "bad reservoir"); break; }
+      slog("SCHED", "reservoir set to %s for the rest of the day (applies from next activation)",
+           reservoirName(todayReservoir));
+      sendStat(c.cmdID, c.cmdType, CMD_ST_DONE, nullptr);
+      break;
+    }
+
+    default:
+      rejectCmd(c, "unknown type");
+      break;
+  }
+}
+
+void processCommands() {
+  PendingCmd c;
+  while (xQueueReceive(cmdQueue, &c, 0) == pdTRUE) executeCommand(c);
+}
+
 // Reservoir for a local day number (WIB, >= 0). Pure function of the day: a reboot never shifts the cycle.
 Reservoir getReservoirForDay(int32_t day) {
   return (day % FERT_CYCLE_DAYS == 0) ? Reservoir::FERT : Reservoir::WATER;
@@ -687,7 +922,11 @@ void resyncSchedules(int32_t day, uint32_t nowSec) {
 // Called in each loop() iteration
 void maintainSchedule() {
   // Stop is based on millis(): keep running even if clock shift or not synced
-  if (isExecutingSchedule && millis() - pumpStartMs >= pumpRunMs) stopPump("duration reached");
+  if (holdOn && !holdActive()) { holdOn = false; slog("PUMP", "hold ended"); }
+  if ((isExecutingSchedule || isExecutingInstant) && millis() - pumpStartMs >= pumpRunMs) {
+    if (isExecutingInstant) endInstant(true, "duration reached");
+    else stopPump("duration reached");
+  }
 
   if (schedules.empty()) return;
 
@@ -711,7 +950,9 @@ void maintainSchedule() {
   }
 
   // 2. active pump on interval [start, stop)
-  if (!isExecutingSchedule && !curScheduleDone &&
+  if (!isExecutingSchedule
+      && !isExecutingInstant && !holdActive()
+      && !curScheduleDone &&
       nowSec >= curSchedule_time.start && nowSec < curSchedule_time.stop) {
     startPump((unsigned long)(curSchedule_time.stop - nowSec) * 1000UL);
   }
@@ -733,7 +974,7 @@ void printStatus() {
   esp_wifi_get_channel(&pri, &sec);
 
   slog("STATUS", "master %s | id %d | ch %d | next %s | pump %s (%s)",
-    mac, slaveID, pri, nxt, isExecutingSchedule ? "ON" : "OFF", reservoirName(todayReservoir));
+    mac, slaveID, pri, nxt, (isExecutingSchedule || isExecutingInstant) ? "ON" : "OFF", reservoirName(todayReservoir));
 
   SlaveState s;
   portENTER_CRITICAL(&stateMux);
@@ -845,6 +1086,71 @@ void onMasterRequest( const uint8_t *incomingData, int len) {
   slogd("REQ", "payload %s", reading.reportBuffer);
 }
 
+void sendCommandAck(uint8_t cmdID, uint8_t cmdType) {
+  slave_command_ack a = {};
+  WiFi.macAddress(a.srcAddr);
+  a.msgType = MSG_SLAVE_COMMAND_ACK;
+  a.cmdID = cmdID;
+  a.cmdType = cmdType;
+  sendToMaster((uint8_t *)&a, sizeof(a));
+}
+
+// WiFi task: validate, de-duplicate, enqueue, ack. Execution happens in loop().
+// Acking here (not in loop) matters: loop() can be blocked ~1.5 s by the sensor read.
+void onMasterCommand(const uint8_t *incomingData, int len, const uint8_t *senderMac) {
+  if (len != sizeof(master_command)) {
+    slogw("CMD", "invalid master_command size: %d (expected %u)", len, (unsigned)sizeof(master_command));
+    return;
+  }
+  if (!master_found || memcmp(senderMac, master_mac, 6) != 0) {
+    slogw("CMD", "command from unknown sender ignored");
+    return;
+  }
+
+  master_command m;
+  memcpy(&m, incomingData, sizeof(m));
+  m.commandBuffer[sizeof(m.commandBuffer) - 1] = '\0';
+
+  uint8_t self[6];
+  WiFi.macAddress(self);
+  if (memcmp(m.dstAddr, self, 6) != 0 || m.slaveID != slaveID) {
+    slogw("CMD", "command not addressed to this slave");
+    return;
+  }
+
+  // only touched from this callback, so no lock is needed
+  static bool          seenUsed[CMD_DEDUP_N] = {};
+  static uint8_t       seenId[CMD_DEDUP_N]   = {};
+  static unsigned long seenMs[CMD_DEDUP_N]   = {};
+  static uint8_t       seenNext = 0;
+
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < CMD_DEDUP_N; i++) {
+    if (seenUsed[i] && seenId[i] == m.cmdID && now - seenMs[i] < CMD_DEDUP_WINDOW_MS) {
+      slogd("CMD", "#%u duplicate, ack re-sent", m.cmdID);
+      sendCommandAck(m.cmdID, m.cmdType);
+      return;
+    }
+  }
+
+  PendingCmd p = {};
+  p.cmdID = m.cmdID;
+  p.cmdType = m.cmdType;
+  memcpy(p.buffer, m.commandBuffer, sizeof(p.buffer));
+  if (xQueueSend(cmdQueue, &p, 0) != pdTRUE) {
+    slogw("CMD", "queue full, #%u not acked (master will retry)", m.cmdID);
+    return;
+  }
+
+  seenUsed[seenNext] = true;
+  seenId[seenNext] = m.cmdID;
+  seenMs[seenNext] = now;
+  seenNext = (seenNext + 1) % CMD_DEDUP_N;
+
+  slog("CMD", "#%u type %u accepted", m.cmdID, m.cmdType);
+  sendCommandAck(m.cmdID, m.cmdType);
+}
+
 /* =====================================================
    ESP-NOW RECEIVE CALLBACK
    ===================================================== */
@@ -868,6 +1174,9 @@ void onDataRecv( const esp_now_recv_info_t *info, const uint8_t *incomingData, i
       onMasterRequest(incomingData, len);
       break;
 
+    case MSG_MASTER_COMMAND:
+      onMasterCommand(incomingData, len, info->src_addr);
+      break;
     // add new message handler here
 
     default:
@@ -908,6 +1217,12 @@ void setup() {
     while (true) {
       delay(1000);
     }
+  }
+
+  cmdQueue = xQueueCreate(CMD_QUEUE_DEPTH, sizeof(PendingCmd));
+  if (cmdQueue == NULL) {
+    slogw("BOOT", "failed to create command queue");
+    while (true) delay(1000);
   }
 
   // Register native receive callback
@@ -983,6 +1298,8 @@ void loop() {
   }
 
   maintainSchedule();
+  processCommands();
+  maintainStat();
 
   // read all sensors every NEW_INT and publish the snapshot
   static unsigned long lastNewState = 0;
