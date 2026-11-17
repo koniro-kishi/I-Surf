@@ -52,8 +52,8 @@
 #define TOKEN_MARGIN_S      300     // login again after 5 min before token expires
 
 // Command path (RTDB -> master)
-#define CMD_TASK_TICK_MS        500       // ms; cloudTask wake-up when no upload is pending
-#define CMD_POLL_INTERVAL       5000      // ms; poll "waiting" commands of every saved slave
+#define CMD_TASK_TICK_MS        100       // ms; cloudTask wake-up when no upload is pending
+#define CMD_POLL_INTERVAL       2000      // ms; poll "waiting" commands of every saved slave
 #define CMD_STALE_MS            300000    // 5 min; older waiting command -> failed(stale), same as dashboard
 #define CMD_BOOT_GRACE_MS       60000     // wait for slaves to re-register after master boot
 #define CMD_TABLE_MAX           8         // in-flight or not-yet-synced commands
@@ -1501,9 +1501,16 @@ int cloudHttp(const char *method, const String &pathQuery, const char *body, Str
   }
   http.addHeader("Content-Type", "application/json");
 
+  unsigned long t0 = millis();
   int code = http.sendRequest(method, (uint8_t *)body, body ? strlen(body) : 0);
-  if (resp && code > 0) *resp = http.getString();
+
+  // 204/304 have no body and no Content-Length: getString() would block until the server
+  // closes the keep-alive connection (~75 s). Never read it.
+  if (resp && code > 0 && code != 204 && code != 304) *resp = http.getString();
   http.end();
+
+  unsigned long dt = millis() - t0;
+  if (dt > CMD_POLL_INTERVAL) Serial.printf("Cloud: slow request %s %s: %lu ms (HTTP %d)\n", method, pathQuery.c_str(), dt, code);
 
   if (code < 0) dbClient.stop();   // broken connection -> reopened on the next request
   if (code == 401) {
@@ -1650,7 +1657,10 @@ void cloudTask(void *) {
   bool reported = false;
 
   for (;;) {
-    // wait briefly for an aggregate to upload, then give the command path a turn
+    // status updates first: small and time-critical (the dashboard shows them)
+    if (wifiFlag == WifiState::CONNECTED) cmdFlushStatus();
+
+    // then wait briefly for an aggregate to upload
     char *payload = nullptr;
     if (xQueueReceive(cloudQueue, &payload, pdMS_TO_TICKS(CMD_TASK_TICK_MS)) == pdTRUE && payload != nullptr) {
       if (wifiFlag == WifiState::CONNECTED && cloudPatchLatest(payload) && !reported) {
@@ -1849,6 +1859,7 @@ static void cloudPollWaiting() {
     for (size_t j = 0; j < k; j++) {
       cmdIntake(slaveNum, keys[j], doc[keys[j]].as<JsonObject>());
     }
+    cmdFlushStatus();   // mark freshly fetched commands right away
   }
 }
 

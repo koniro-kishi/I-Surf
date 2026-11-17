@@ -41,6 +41,11 @@
 #define pin_SoilMoist 33
 #define pin_SoilPH 32
 
+// Relay module polarity: this 2-channel module is ACTIVE-LOW (relay energizes when the pin is LOW)
+#define RELAY_ACTIVE_LOW  true
+#define RELAY_ON_LEVEL    (RELAY_ACTIVE_LOW ? LOW : HIGH)
+#define RELAY_OFF_LEVEL   (RELAY_ACTIVE_LOW ? HIGH : LOW)
+
 // Environment constantas
 #define SCOUNT 30            // TDS sample points (median filter)
 #define SOUND_SPEED 0.034    // cm/us
@@ -89,8 +94,8 @@ static_assert(sizeof(NVS_SCHEDULE_NAMESPACE) - 1 <= 15, "NVS namespace max 15 ch
 #define CMD_ST_FAILED       4
 
 // Commands
-#define ON_LIMIT_IRR_MS      120000UL    // timed_instant run time
-#define OFF_TIME_IRR_MS      1800000UL   // 30 min; deactivation hold
+#define ON_LIMIT_IRR_MS      60000UL    // TEST value; production 120000UL; 2 min
+#define OFF_TIME_IRR_MS      60000UL    // TEST value; production 1800000UL; 30 min
 #define CMD_DEDUP_N          8
 #define CMD_DEDUP_WINDOW_MS  30000UL     // same cmdID within this window = retry, not a new command
 #define CMD_QUEUE_DEPTH      4
@@ -353,6 +358,9 @@ float readTDS(int &medianMv, float temp) {
   return tds * tdsK;
 }
 
+void relayWrite(uint8_t pin, bool on) { digitalWrite(pin, on ? RELAY_ON_LEVEL : RELAY_OFF_LEVEL); }
+bool relayIsOn(uint8_t pin) { return digitalRead(pin) == RELAY_ON_LEVEL; }
+
 // Read all sensors once and return the new state.
 // Order: pH first, TDS last (keeps the two probes apart in time).
 SlaveState newSlaveState() {
@@ -382,8 +390,8 @@ SlaveState newSlaveState() {
   int soilRaw = analogRead(pin_SoilMoist);
   s.soilMoist = round2(constrain((float)(AirValue - soilRaw) / (float)(AirValue - WaterValue), 0.0f, 1.0f));
 
-  // 4. pump state (relays active-HIGH)
-  s.isPumpOn = (digitalRead(pin_WaterPump) == HIGH) || (digitalRead(pin_FertPump) == HIGH);
+  // 4. pump state (relays active-LOW)
+  s.isPumpOn = relayIsOn(pin_WaterPump) || relayIsOn(pin_FertPump);
   s.useReservoir = reservoirName(todayReservoir);
 
   // 5. TDS last (SCOUNT samples, blocks ~1.2 s)
@@ -403,10 +411,12 @@ SlaveState newSlaveState() {
 
 // Pins and safe relay state. Called first in setup().
 void initSensorsAndRelays() {
+  relayWrite(pin_WaterPump, false);
+  relayWrite(pin_FertPump, false);
   pinMode(pin_WaterPump, OUTPUT);
   pinMode(pin_FertPump, OUTPUT);
-  digitalWrite(pin_WaterPump, LOW);   // active-HIGH: LOW = off
-  digitalWrite(pin_FertPump, LOW);
+  relayWrite(pin_WaterPump, false);
+  relayWrite(pin_FertPump, false);
 
   pinMode(pin_WaterUS_Trig, OUTPUT);
   pinMode(pin_WaterUS_Echo, INPUT);
@@ -754,9 +764,9 @@ uint8_t pumpPin(Reservoir r) { return r == Reservoir::FERT ? pin_FertPump : pin_
 
 void startPump(unsigned long runMs) {
   // exclusivity guard: both relays LOW first, then only the selected one goes HIGH
-  digitalWrite(pin_WaterPump, LOW);
-  digitalWrite(pin_FertPump, LOW);
-  digitalWrite(pumpPin(todayReservoir), HIGH);
+  relayWrite(pin_WaterPump, false);   // exclusivity guard
+  relayWrite(pin_FertPump, false);
+  relayWrite(pumpPin(todayReservoir), true);
   pumpStartMs = millis();
   pumpRunMs = runMs;
   isExecutingSchedule = true;
@@ -768,8 +778,8 @@ void startPump(unsigned long runMs) {
 }
 
 void stopPump(const char *reason) {
-  digitalWrite(pin_WaterPump, LOW);
-  digitalWrite(pin_FertPump, LOW);
+  relayWrite(pin_WaterPump, false);
+  relayWrite(pin_FertPump, false);
   isExecutingSchedule = false;
   slog("PUMP", "OFF (%s)", reason);
 }
@@ -812,9 +822,9 @@ void maintainStat() {
 }
 
 // End of a timed_instant run: completed = ran the full ON_LIMIT
-void endInstant(bool completed, const char *reason) {
-  digitalWrite(pin_WaterPump, LOW);
-  digitalWrite(pin_FertPump, LOW);
+void stopInstantPump(bool completed, const char *reason) {
+  relayWrite(pin_WaterPump, false);
+  relayWrite(pin_FertPump, false);
   isExecutingInstant = false;
   slog("PUMP", "OFF (instant: %s)", reason);
   if (instantCmdID != 0) {
@@ -825,9 +835,9 @@ void endInstant(bool completed, const char *reason) {
 }
 
 void startInstantPump(uint8_t cmdID) {
-  digitalWrite(pin_WaterPump, LOW);   // exclusivity guard, same as startPump()
-  digitalWrite(pin_FertPump, LOW);
-  digitalWrite(pumpPin(todayReservoir), HIGH);
+  relayWrite(pin_WaterPump, false);   // exclusivity guard
+  relayWrite(pin_FertPump, false);
+  relayWrite(pumpPin(todayReservoir), true);
   pumpStartMs = millis();
   pumpRunMs = ON_LIMIT_IRR_MS;
   isExecutingInstant = true;
@@ -861,7 +871,7 @@ void executeCommand(const PendingCmd &c) {
       holdOn = true;
       holdUntilMs = millis() + OFF_TIME_IRR_MS;
       slog("PUMP", "hold for %lu s (deactivation #%u)", OFF_TIME_IRR_MS / 1000UL, c.cmdID);
-      if (isExecutingInstant) endInstant(false, "deactivation");
+      if (isExecutingInstant) stopInstantPump(false, "deactivation");
       if (isExecutingSchedule) {
         stopPump("deactivation");
         curScheduleDone = false;   // may resume after the hold if still inside its window
@@ -924,7 +934,7 @@ void maintainSchedule() {
   // Stop is based on millis(): keep running even if clock shift or not synced
   if (holdOn && !holdActive()) { holdOn = false; slog("PUMP", "hold ended"); }
   if ((isExecutingSchedule || isExecutingInstant) && millis() - pumpStartMs >= pumpRunMs) {
-    if (isExecutingInstant) endInstant(true, "duration reached");
+    if (isExecutingInstant) stopInstantPump(true, "duration reached");
     else stopPump("duration reached");
   }
 
